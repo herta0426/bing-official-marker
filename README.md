@@ -29,7 +29,7 @@
 
 1. 确保浏览器已安装 [Tampermonkey](https://www.tampermonkey.net/)（Chrome/Edge）或 Greasemonkey（Firefox）。
 2. 点击下方链接安装脚本（或新建脚本，粘贴源码）：
-   - [安装脚本（raw）](https://raw.githubusercontent.com/herta0426/bing-official-marker/main/src/baidudreamourbings.user.js)
+   - [安装脚本（GitHub）](https://github.com/herta0426/bing-official-marker/raw/refs/heads/main/baidudreamourbings.user.js)
 3. 访问必应搜索页面（如 `https://cn.bing.com/search?q=微信`），脚本将自动运行。
 
 ### 使用说明
