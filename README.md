@@ -1,5 +1,6 @@
-# Baidu Dream Our Bings - official site mark from Baidu
-# 基于百度的Bing官网标签体验优化
+# bing-official-marker
+## Baidu Dream Our Bings - official site mark from Baidu
+## 基于百度的Bing官网标签体验优化
 
 
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-brightgreen)](https://www.tampermonkey.net/)
