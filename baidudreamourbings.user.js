@@ -45,6 +45,8 @@
         entertainment: ['电影', '电视剧', '音乐', '游戏', '明星'],
         realtime: ['股票', '基金', '汇率', '彩票', '比分']
     };
+    const DEFAULT_DOWNLOAD_KEYWORDS = ['下载', '安装包', '软件', '客户端', '驱动', '固件', 'apk', 'exe', 'msi', 'iso', '破解', '汉化版', '绿色版', '便携版', '最新版', '官方安装', 'pc版', 'windows版', 'mac版', '安卓版', 'ios版', 'download', 'installer', 'setup', 'driver', 'firmware', 'portable', 'crack', 'patched'];
+    const DEFAULT_DOWNLOAD_EXTENSIONS = ['.exe', '.msi', '.apk', '.dmg', '.zip', '.rar', '.7z', '.iso', '.deb', '.pkg'];
 
     function defaultConfig() {
         return {
@@ -53,6 +55,10 @@
             unknownConfirmation: true,
             riskBlocking: true,
             cacheMinutes: 10,
+            protectionMode: 'download',
+            downloadKeywords: [...DEFAULT_DOWNLOAD_KEYWORDS],
+            downloadExtensions: [...DEFAULT_DOWNLOAD_EXTENSIONS],
+            alwaysBlockRisk: true,
             exclusions: { enabled: true, presets: { weather: true, news: true, lifestyle: true, entertainment: false, realtime: true }, words: [] },
             engines: { baidu: true, google: false, duckduckgo: false, sogou: false, so360: false },
             ai: { enabled: false, provider: 'openai', baseUrl: AI_PROVIDERS.openai.baseUrl, model: AI_PROVIDERS.openai.model, apiKey: '' }
@@ -116,6 +122,28 @@
         return words.some(word => text.includes(String(word).toLowerCase()));
     }
 
+    function hasDownloadIntent(keyword, config) {
+        const words = Array.isArray(config?.downloadKeywords) ? config.downloadKeywords : DEFAULT_DOWNLOAD_KEYWORDS;
+        const text = String(keyword || '').toLowerCase();
+        return words.some(word => text.includes(String(word).toLowerCase()));
+    }
+
+    function isDownloadUrl(value, config) {
+        const url = normalizeHttpUrl(value);
+        if (!url) return false;
+        const extensions = Array.isArray(config?.downloadExtensions) ? config.downloadExtensions : DEFAULT_DOWNLOAD_EXTENSIONS;
+        return extensions.some(extension => url.pathname.toLowerCase().endsWith(String(extension).toLowerCase())) || /(^|\/)(download|downloads|software|installer|releases?)(\/|$)/i.test(url.pathname);
+    }
+
+    function shouldConfirmNavigation(url, matched, matchType, keyword, config) {
+        const mode = config?.protectionMode || 'download';
+        if (mode === 'mark') return false;
+        const decision = getResultDecision(url, matched, matchType);
+        if (decision.level === 'high-risk' && config?.alwaysBlockRisk !== false) return true;
+        if (mode === 'strict') return decision.requiresConfirmation;
+        return hasDownloadIntent(keyword, config) || isDownloadUrl(url, config);
+    }
+
     function loadConfig() {
         try { return normalizeConfig(GM_getValue('bom-config', defaultConfig())); } catch (_) { return defaultConfig(); }
     }
@@ -144,7 +172,7 @@
         overlay.innerHTML = `<div class="bom-config" role="dialog" aria-modal="true" aria-labelledby="bom-config-title">
           <div class="bom-config-head"><div><div class="bom-kicker">BING OFFICIAL MARKER</div><h1 id="bom-config-title">安全与比对配置</h1></div><button type="button" data-bom-close aria-label="关闭">×</button></div>
           <p class="bom-note">百度认证、多引擎和 AI 都只是参考信号，最终拦截规则始终由本地安全规则决定。</p>
-          <section><h2>搜索行为</h2><label><input type="checkbox" data-bom-enabled> 启用官网标记</label><label><input type="checkbox" data-bom-unknown> 未验证结果点击前确认</label><label><input type="checkbox" data-bom-risk> 高风险链接默认拦截</label><label>缓存时间 <input type="number" min="0" max="1440" data-bom-cache> 分钟</label></section>
+          <section><h2>搜索行为</h2><label><input type="checkbox" data-bom-enabled> 启用官网标记</label><label>保护模式 <select data-bom-mode><option value="download">下载保护（推荐）</option><option value="strict">严格保护</option><option value="mark">仅标记</option></select></label><label><input type="checkbox" data-bom-risk> 高风险链接始终拦截</label><label>缓存时间 <input type="number" min="0" max="1440" data-bom-cache> 分钟</label><label>下载意图关键词（每行一个）<textarea rows="4" data-bom-download-words></textarea></label><label>下载扩展名（每行一个）<textarea rows="2" data-bom-download-exts></textarea></label></section>
           <section><h2>排除词</h2><p class="bom-note">命中排除词时不请求百度、不调用 AI，也不修改 Bing 结果。</p><div class="bom-presets"><label><input type="checkbox" data-bom-preset="weather"> 天气</label><label><input type="checkbox" data-bom-preset="news"> 新闻</label><label><input type="checkbox" data-bom-preset="lifestyle"> 生活</label><label><input type="checkbox" data-bom-preset="entertainment"> 娱乐</label><label><input type="checkbox" data-bom-preset="realtime"> 实时信息</label></div><label>自定义排除词（每行一个）<textarea rows="4" data-bom-words></textarea></label></section>
           <section><h2>多引擎参考</h2><div class="bom-presets"><label><input type="checkbox" data-bom-engine="baidu"> 百度认证</label><label><input type="checkbox" data-bom-engine="google"> Google</label><label><input type="checkbox" data-bom-engine="duckduckgo"> DuckDuckGo</label><label><input type="checkbox" data-bom-engine="sogou"> 搜狗</label><label><input type="checkbox" data-bom-engine="so360"> 360 搜索</label></div><p class="bom-note">当前版本保存引擎偏好；跨站抓取需各引擎允许访问，默认只启用百度。</p></section>
           <section><h2>AI 辅助比对</h2><label><input type="checkbox" data-bom-ai-enabled> 启用 AI 辅助分析</label><label>服务商 <select data-bom-ai-provider><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="qwen">通义千问</option><option value="custom">自定义 OpenAI 兼容接口</option></select></label><label>接口地址 <input type="url" data-bom-ai-url placeholder="https://api.example.com/v1"></label><label>API Key <input type="password" data-bom-ai-key autocomplete="off" placeholder="只保存在浏览器扩展存储"></label><label>模型 <select data-bom-ai-model-select data-bom-model-select><option value="custom">自定义</option></select></label><button type="button" data-bom-fetch-models>获取模型列表</button><label data-bom-custom-model hidden>自定义模型 <input type="text" data-bom-ai-model-custom placeholder="输入模型名称"></label><p class="bom-model-status" data-bom-model-status></p><p class="bom-note">只发送搜索词、标题、域名和 URL，不发送网页正文。AI 不能解除本地高风险拦截。</p></section>
@@ -159,9 +187,11 @@
         const $ = selector => overlay.querySelector(selector);
         const fill = current => {
             $('[data-bom-enabled]').checked = current.enabled;
-            $('[data-bom-unknown]').checked = current.unknownConfirmation !== false;
-            $('[data-bom-risk]').checked = current.riskBlocking !== false;
+            $('[data-bom-risk]').checked = current.alwaysBlockRisk !== false;
             $('[data-bom-cache]').value = current.cacheMinutes ?? 10;
+            $('[data-bom-mode]').value = current.protectionMode || 'download';
+            $('[data-bom-download-words]').value = (current.downloadKeywords || DEFAULT_DOWNLOAD_KEYWORDS).join('\n');
+            $('[data-bom-download-exts]').value = (current.downloadExtensions || DEFAULT_DOWNLOAD_EXTENSIONS).join('\n');
             $('[data-bom-words]').value = current.exclusions.words.join('\n');
             overlay.querySelectorAll('[data-bom-preset]').forEach(el => el.checked = current.exclusions.presets[el.dataset.bomPreset] !== false);
             overlay.querySelectorAll('[data-bom-engine]').forEach(el => el.checked = current.engines[el.dataset.bomEngine] === true);
@@ -182,8 +212,10 @@
         $('[data-bom-reset]').addEventListener('click', () => fill(defaultConfig()));
         $('[data-bom-save]').addEventListener('click', () => {
             const next = normalizeConfig({
-                enabled: $('[data-bom-enabled]').checked, unknownConfirmation: $('[data-bom-unknown]').checked, riskBlocking: $('[data-bom-risk]').checked,
+                enabled: $('[data-bom-enabled]').checked, protectionMode: $('[data-bom-mode]').value, alwaysBlockRisk: $('[data-bom-risk]').checked,
                 cacheMinutes: Math.max(0, Math.min(1440, Number($('[data-bom-cache]').value) || 10)),
+                downloadKeywords: $('[data-bom-download-words]').value.split(/\r?\n|[,，]/).map(word => word.trim()).filter(Boolean),
+                downloadExtensions: $('[data-bom-download-exts]').value.split(/\r?\n|[,，]/).map(word => word.trim()).filter(Boolean),
                 exclusions: { enabled: true, presets: Object.fromEntries([...overlay.querySelectorAll('[data-bom-preset]')].map(el => [el.dataset.bomPreset, el.checked])), words: $('[data-bom-words]').value.split(/\r?\n|[,，]/).map(word => word.trim()).filter(Boolean) },
                 engines: Object.fromEntries([...overlay.querySelectorAll('[data-bom-engine]')].map(el => [el.dataset.bomEngine, el.checked])),
                 ai: { enabled: $('[data-bom-ai-enabled]').checked, provider: $('[data-bom-ai-provider]').value, baseUrl: $('[data-bom-ai-url]').value.trim(), model: $('[data-bom-ai-model-select]').value === 'custom' ? $('[data-bom-ai-model-custom]').value.trim() : $('[data-bom-ai-model-select]').value, apiKey: $('[data-bom-ai-key]').value }
@@ -587,14 +619,12 @@
                 titleContainer.appendChild(createTag(decision.label, evidenceTitle, extraStyle));
             }
             const decision = getResultDecision(link.href, matched, matchType);
-            if (decision.label === '未验证' && config.unknownConfirmation === false) decision.requiresConfirmation = false;
-            if (decision.level === 'high-risk' && config.riskBlocking === false) decision.requiresConfirmation = false;
+            decision.requiresConfirmation = shouldConfirmNavigation(link.href, matched, matchType, keyword, config);
             installNavigationGuard(link, decision, matched && matched.url);
             item.querySelectorAll('a[href]').forEach((anchor) => {
                 if (anchor === link) return;
                 const decision = getResultDecision(anchor.href, null, 'none');
-                if (decision.label === '未验证' && config.unknownConfirmation === false) decision.requiresConfirmation = false;
-                if (decision.level === 'high-risk' && config.riskBlocking === false) decision.requiresConfirmation = false;
+                decision.requiresConfirmation = shouldConfirmNavigation(anchor.href, null, 'none', keyword, config);
                 installNavigationGuard(anchor, decision, null);
             });
             if (matched) {
@@ -661,7 +691,7 @@
     }
 
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision, defaultConfig, normalizeConfig, aiProviderPresets, exclusionPresetWords, shouldExcludeKeyword, summarizeEngineEvidence, extractModelIds };
+        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision, defaultConfig, normalizeConfig, aiProviderPresets, exclusionPresetWords, shouldExcludeKeyword, summarizeEngineEvidence, extractModelIds, hasDownloadIntent, isDownloadUrl, shouldConfirmNavigation };
         return;
     }
 

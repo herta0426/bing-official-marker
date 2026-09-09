@@ -96,3 +96,24 @@ test('normalizes model list responses and always keeps custom option', () => {
   assert.deepEqual(api.extractModelIds({ data: [{ id: 'gpt-a' }, { id: 'gpt-b' }] }), ['gpt-a', 'gpt-b', 'custom']);
   assert.deepEqual(api.extractModelIds({ models: [{ name: 'qwen-plus' }] }), ['qwen-plus', 'custom']);
 });
+
+test('detects download intent without flagging ordinary searches', () => {
+  const config = api.defaultConfig();
+  assert.equal(api.hasDownloadIntent('北京天气', config), false);
+  assert.equal(api.hasDownloadIntent('微信 官方下载', config), true);
+  assert.equal(api.hasDownloadIntent('download chrome', config), true);
+  assert.equal(api.hasDownloadIntent('安装包', config), true);
+});
+
+test('detects downloadable result URLs', () => {
+  assert.equal(api.isDownloadUrl('https://example.com/download/app.exe', api.defaultConfig()), true);
+  assert.equal(api.isDownloadUrl('https://example.com/article/how-to-install', api.defaultConfig()), false);
+  assert.equal(api.isDownloadUrl('https://example.com/file.zip', api.defaultConfig()), true);
+});
+
+test('uses download mode to avoid prompts for ordinary searches', () => {
+  const config = api.defaultConfig();
+  assert.equal(api.shouldConfirmNavigation('https://unknown.example/article', null, 'none', '普通搜索', config), false);
+  assert.equal(api.shouldConfirmNavigation('https://unknown.example/download/app.exe', null, 'none', '普通搜索', config), true);
+  assert.equal(api.shouldConfirmNavigation('https://unknown.example/article', null, 'none', '某软件下载', config), true);
+});
