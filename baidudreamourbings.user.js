@@ -88,6 +88,18 @@
         return { matches, label: matches > 1 ? '多引擎参考' : matches === 1 ? '单引擎参考' : '未找到一致结果', trusted: false };
     }
 
+    function extractModelIds(payload) {
+        const entries = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.models) ? payload.models : [];
+        const ids = entries.map(item => typeof item === 'string' ? item : item?.id || item?.name).filter(Boolean);
+        return [...new Set([...ids, 'custom'])];
+    }
+
+    function fetchModelIds(config) {
+        const endpoint = config.ai.baseUrl.replace(/\/$/, '') + '/models';
+        if (!config.ai.apiKey || !/^https:\/\/(api\.openai\.com|api\.deepseek\.com|dashscope\.aliyuncs\.com)\//.test(endpoint)) return Promise.reject(new Error('请填写预设服务商的 API Key 和接口地址'));
+        return new Promise((resolve, reject) => GM_xmlhttpRequest({ method: 'GET', url: endpoint, anonymous: true, timeout: 15000, headers: { Authorization: 'Bearer ' + config.ai.apiKey }, onload: response => { try { if (response.status < 200 || response.status >= 300) throw new Error('HTTP ' + response.status); resolve(extractModelIds(JSON.parse(response.responseText))); } catch (error) { reject(error); } }, onerror: () => reject(new Error('模型列表请求失败')), ontimeout: () => reject(new Error('模型列表请求超时')) }));
+    }
+
     function fetchEngineDomains(keyword, engine) {
         const urls = { google: `https://www.google.com/search?q=${encodeURIComponent(keyword)}`, duckduckgo: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(keyword)}`, sogou: `https://www.sogou.com/web?query=${encodeURIComponent(keyword)}`, so360: `https://www.so.com/s?q=${encodeURIComponent(keyword)}` };
         if (!urls[engine]) return Promise.resolve(new Set());
@@ -135,7 +147,7 @@
           <section><h2>搜索行为</h2><label><input type="checkbox" data-bom-enabled> 启用官网标记</label><label><input type="checkbox" data-bom-unknown> 未验证结果点击前确认</label><label><input type="checkbox" data-bom-risk> 高风险链接默认拦截</label><label>缓存时间 <input type="number" min="0" max="1440" data-bom-cache> 分钟</label></section>
           <section><h2>排除词</h2><p class="bom-note">命中排除词时不请求百度、不调用 AI，也不修改 Bing 结果。</p><div class="bom-presets"><label><input type="checkbox" data-bom-preset="weather"> 天气</label><label><input type="checkbox" data-bom-preset="news"> 新闻</label><label><input type="checkbox" data-bom-preset="lifestyle"> 生活</label><label><input type="checkbox" data-bom-preset="entertainment"> 娱乐</label><label><input type="checkbox" data-bom-preset="realtime"> 实时信息</label></div><label>自定义排除词（每行一个）<textarea rows="4" data-bom-words></textarea></label></section>
           <section><h2>多引擎参考</h2><div class="bom-presets"><label><input type="checkbox" data-bom-engine="baidu"> 百度认证</label><label><input type="checkbox" data-bom-engine="google"> Google</label><label><input type="checkbox" data-bom-engine="duckduckgo"> DuckDuckGo</label><label><input type="checkbox" data-bom-engine="sogou"> 搜狗</label><label><input type="checkbox" data-bom-engine="so360"> 360 搜索</label></div><p class="bom-note">当前版本保存引擎偏好；跨站抓取需各引擎允许访问，默认只启用百度。</p></section>
-          <section><h2>AI 辅助比对</h2><label><input type="checkbox" data-bom-ai-enabled> 启用 AI 辅助分析</label><label>服务商 <select data-bom-ai-provider><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="qwen">通义千问</option><option value="custom">自定义 OpenAI 兼容接口</option></select></label><label>接口地址 <input type="url" data-bom-ai-url placeholder="https://api.example.com/v1"></label><label>模型 <input type="text" data-bom-ai-model placeholder="模型名称"></label><label>API Key <input type="password" data-bom-ai-key autocomplete="off" placeholder="只保存在浏览器扩展存储"></label><p class="bom-note">只发送搜索词、标题、域名和 URL，不发送网页正文。AI 不能解除本地高风险拦截。</p></section>
+          <section><h2>AI 辅助比对</h2><label><input type="checkbox" data-bom-ai-enabled> 启用 AI 辅助分析</label><label>服务商 <select data-bom-ai-provider><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="qwen">通义千问</option><option value="custom">自定义 OpenAI 兼容接口</option></select></label><label>接口地址 <input type="url" data-bom-ai-url placeholder="https://api.example.com/v1"></label><label>API Key <input type="password" data-bom-ai-key autocomplete="off" placeholder="只保存在浏览器扩展存储"></label><label>模型 <select data-bom-ai-model-select data-bom-model-select><option value="custom">自定义</option></select></label><button type="button" data-bom-fetch-models>获取模型列表</button><label data-bom-custom-model hidden>自定义模型 <input type="text" data-bom-ai-model-custom placeholder="输入模型名称"></label><p class="bom-model-status" data-bom-model-status></p><p class="bom-note">只发送搜索词、标题、域名和 URL，不发送网页正文。AI 不能解除本地高风险拦截。</p></section>
           <div class="bom-actions"><button type="button" data-bom-reset>恢复默认</button><button type="button" data-bom-cancel>取消</button><button type="button" data-bom-save>保存配置</button></div><div class="bom-status" role="status" data-bom-status></div>
         </div>`;
         GM_addStyle(`
@@ -156,13 +168,17 @@
             $('[data-bom-ai-enabled]').checked = current.ai.enabled;
             $('[data-bom-ai-provider]').value = current.ai.provider;
             $('[data-bom-ai-url]').value = current.ai.baseUrl;
-            $('[data-bom-ai-model]').value = current.ai.model;
+            $('[data-bom-ai-model-select]').value = 'custom';
+            $('[data-bom-ai-model-custom]').value = current.ai.model;
+            $('[data-bom-custom-model]').hidden = true;
             $('[data-bom-ai-key]').value = current.ai.apiKey;
         };
         fill(config);
         const close = () => overlay.remove();
         overlay.querySelectorAll('[data-bom-close],[data-bom-cancel]').forEach(el => el.addEventListener('click', close));
-        $('[data-bom-ai-provider]').addEventListener('change', event => { const preset = AI_PROVIDERS[event.target.value]; if (preset) { $('[data-bom-ai-url]').value = preset.baseUrl; $('[data-bom-ai-model]').value = preset.model; } });
+        $('[data-bom-ai-provider]').addEventListener('change', event => { const preset = AI_PROVIDERS[event.target.value]; if (preset) { $('[data-bom-ai-url]').value = preset.baseUrl; $('[data-bom-ai-model-select]').value = 'custom'; $('[data-bom-ai-model-custom]').value = preset.model; $('[data-bom-custom-model]').hidden = false; } });
+        $('[data-bom-ai-model-select]').addEventListener('change', event => { $('[data-bom-custom-model]').hidden = event.target.value !== 'custom'; });
+        $('[data-bom-fetch-models]').addEventListener('click', async () => { const status = $('[data-bom-model-status]'); status.textContent = '正在获取模型列表...'; try { const models = await fetchModelIds({ ai: { apiKey: $('[data-bom-ai-key]').value, baseUrl: $('[data-bom-ai-url]').value } }); const select = $('[data-bom-ai-model-select]'); select.replaceChildren(); models.forEach(model => { const option = document.createElement('option'); option.value = model; option.textContent = model; select.appendChild(option); }); select.value = 'custom'; $('[data-bom-custom-model]').hidden = false; status.textContent = `已获取 ${models.length - 1} 个模型`; } catch (error) { status.textContent = error.message; } });
         $('[data-bom-reset]').addEventListener('click', () => fill(defaultConfig()));
         $('[data-bom-save]').addEventListener('click', () => {
             const next = normalizeConfig({
@@ -170,7 +186,7 @@
                 cacheMinutes: Math.max(0, Math.min(1440, Number($('[data-bom-cache]').value) || 10)),
                 exclusions: { enabled: true, presets: Object.fromEntries([...overlay.querySelectorAll('[data-bom-preset]')].map(el => [el.dataset.bomPreset, el.checked])), words: $('[data-bom-words]').value.split(/\r?\n|[,，]/).map(word => word.trim()).filter(Boolean) },
                 engines: Object.fromEntries([...overlay.querySelectorAll('[data-bom-engine]')].map(el => [el.dataset.bomEngine, el.checked])),
-                ai: { enabled: $('[data-bom-ai-enabled]').checked, provider: $('[data-bom-ai-provider]').value, baseUrl: $('[data-bom-ai-url]').value.trim(), model: $('[data-bom-ai-model]').value.trim(), apiKey: $('[data-bom-ai-key]').value }
+                ai: { enabled: $('[data-bom-ai-enabled]').checked, provider: $('[data-bom-ai-provider]').value, baseUrl: $('[data-bom-ai-url]').value.trim(), model: $('[data-bom-ai-model-select]').value === 'custom' ? $('[data-bom-ai-model-custom]').value.trim() : $('[data-bom-ai-model-select]').value, apiKey: $('[data-bom-ai-key]').value }
             });
             saveConfig(next); $('[data-bom-status]').textContent = '已保存。刷新搜索页后生效。';
         });
@@ -645,7 +661,7 @@
     }
 
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision, defaultConfig, normalizeConfig, aiProviderPresets, exclusionPresetWords, shouldExcludeKeyword, summarizeEngineEvidence };
+        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision, defaultConfig, normalizeConfig, aiProviderPresets, exclusionPresetWords, shouldExcludeKeyword, summarizeEngineEvidence, extractModelIds };
         return;
     }
 

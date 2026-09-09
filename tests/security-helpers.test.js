@@ -91,3 +91,8 @@ test('summarizes multi-engine evidence without upgrading trust', () => {
   assert.equal(result.label, '多引擎参考');
   assert.equal(result.trusted, false);
 });
+
+test('normalizes model list responses and always keeps custom option', () => {
+  assert.deepEqual(api.extractModelIds({ data: [{ id: 'gpt-a' }, { id: 'gpt-b' }] }), ['gpt-a', 'gpt-b', 'custom']);
+  assert.deepEqual(api.extractModelIds({ models: [{ name: 'qwen-plus' }] }), ['qwen-plus', 'custom']);
+});
