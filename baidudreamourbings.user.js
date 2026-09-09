@@ -6,7 +6,18 @@
 // @author       herta0426
 // @match        https://*.bing.com/search?*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @connect      www.baidu.com
+// @connect      api.openai.com
+// @connect      api.deepseek.com
+// @connect      dashscope.aliyuncs.com
+// @connect      www.google.com
+// @connect      html.duckduckgo.com
+// @connect      www.sogou.com
+// @connect      www.so.com
 // ==/UserScript==
 
 (function() {
@@ -20,6 +31,151 @@
     const SHORTENER_HOSTS = new Set([
         'bit.ly', 't.co', 'tinyurl.com', 'goo.gl', 'is.gd', 'ow.ly', 'rb.gy'
     ]);
+
+    const AI_PROVIDERS = {
+        openai: { name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', apiKey: '' },
+        deepseek: { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', apiKey: '' },
+        qwen: { name: '通义千问', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', apiKey: '' },
+        custom: { name: '自定义 OpenAI 兼容接口', baseUrl: '', model: '', apiKey: '' }
+    };
+    const EXCLUSION_PRESETS = {
+        weather: ['天气', '气温', '降雨', '台风', '空气质量'],
+        news: ['新闻', '热点', '头条', '时政', '财经新闻'],
+        lifestyle: ['菜谱', '美食', '旅游', '酒店', '机票', '公交', '地铁'],
+        entertainment: ['电影', '电视剧', '音乐', '游戏', '明星'],
+        realtime: ['股票', '基金', '汇率', '彩票', '比分']
+    };
+
+    function defaultConfig() {
+        return {
+            version: 1,
+            enabled: true,
+            unknownConfirmation: true,
+            riskBlocking: true,
+            cacheMinutes: 10,
+            exclusions: { enabled: true, presets: { weather: true, news: true, lifestyle: true, entertainment: false, realtime: true }, words: [] },
+            engines: { baidu: true, google: false, duckduckgo: false, sogou: false, so360: false },
+            ai: { enabled: false, provider: 'openai', baseUrl: AI_PROVIDERS.openai.baseUrl, model: AI_PROVIDERS.openai.model, apiKey: '' }
+        };
+    }
+
+    function normalizeConfig(input) {
+        const base = defaultConfig();
+        const value = input && typeof input === 'object' ? input : {};
+        const ai = value.ai && typeof value.ai === 'object' ? value.ai : {};
+        const provider = AI_PROVIDERS[ai.provider] ? ai.provider : base.ai.provider;
+        return {
+            ...base,
+            ...value,
+            exclusions: { ...base.exclusions, ...(value.exclusions || {}), presets: { ...base.exclusions.presets, ...((value.exclusions || {}).presets || {}) }, words: Array.isArray((value.exclusions || {}).words) ? [...new Set(value.exclusions.words.filter(word => typeof word === 'string' && word.trim()))] : base.exclusions.words },
+            engines: { ...base.engines, ...(value.engines || {}) },
+            ai: { ...base.ai, ...ai, provider, apiKey: typeof ai.apiKey === 'string' ? ai.apiKey : '' }
+        };
+    }
+
+    function aiProviderPresets() {
+        return JSON.parse(JSON.stringify(AI_PROVIDERS));
+    }
+
+    function exclusionPresetWords() {
+        return JSON.parse(JSON.stringify(EXCLUSION_PRESETS));
+    }
+
+    function summarizeEngineEvidence(candidateUrl, evidence) {
+        const host = normalizeHttpUrl(candidateUrl)?.hostname;
+        const domain = host ? getRegistrableDomain(host) : '';
+        const matches = Object.values(evidence || {}).filter(domains => domains && [...domains].some(value => getRegistrableDomain(value) === domain)).length;
+        return { matches, label: matches > 1 ? '多引擎参考' : matches === 1 ? '单引擎参考' : '未找到一致结果', trusted: false };
+    }
+
+    function fetchEngineDomains(keyword, engine) {
+        const urls = { google: `https://www.google.com/search?q=${encodeURIComponent(keyword)}`, duckduckgo: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(keyword)}`, sogou: `https://www.sogou.com/web?query=${encodeURIComponent(keyword)}`, so360: `https://www.so.com/s?q=${encodeURIComponent(keyword)}` };
+        if (!urls[engine]) return Promise.resolve(new Set());
+        return new Promise(resolve => GM_xmlhttpRequest({ method: 'GET', url: urls[engine], anonymous: true, timeout: 10000, onload: response => { if (response.status !== 200) return resolve(new Set()); const domains = new Set(); const parser = new DOMParser(); const doc = parser.parseFromString(response.responseText, 'text/html'); doc.querySelectorAll('a[href]').forEach(anchor => { const parsed = normalizeHttpUrl(anchor.href); if (parsed && parsed.protocol === 'https:') domains.add(parsed.hostname); }); resolve(domains); }, onerror: () => resolve(new Set()), ontimeout: () => resolve(new Set()) }));
+    }
+
+    function shouldExcludeKeyword(keyword, config) {
+        if (!config || !config.exclusions || !config.exclusions.enabled) return false;
+        const text = String(keyword || '').toLowerCase();
+        const presetWords = Object.entries(config.exclusions.presets || {})
+            .filter(([, enabled]) => enabled)
+            .flatMap(([name]) => EXCLUSION_PRESETS[name] || []);
+        const words = [...new Set([...(config.exclusions.words || []), ...presetWords])];
+        return words.some(word => text.includes(String(word).toLowerCase()));
+    }
+
+    function loadConfig() {
+        try { return normalizeConfig(GM_getValue('bom-config', defaultConfig())); } catch (_) { return defaultConfig(); }
+    }
+
+    function saveConfig(config) {
+        GM_setValue('bom-config', normalizeConfig(config));
+    }
+
+    function requestAiReview(keyword, candidates, config) {
+        if (!config.ai.enabled || !config.ai.apiKey || !config.ai.baseUrl || !config.ai.model) return Promise.resolve(null);
+        const endpoint = config.ai.baseUrl.replace(/\/$/, '') + '/chat/completions';
+        const body = JSON.stringify({ model: config.ai.model, temperature: 0, max_tokens: 240, messages: [
+            { role: 'system', content: '仅根据搜索词、标题、域名和URL给出简短风险参考。不要宣称绝对安全，不要覆盖本地规则。' },
+            { role: 'user', content: JSON.stringify({ keyword, candidates: candidates.map(item => ({ title: item.title, url: item.url, domain: item.displayDomain })) }) }
+        ] });
+        const request = typeof GM_xmlhttpRequest === 'function' && /^https:\/\/(api\.openai\.com|api\.deepseek\.com|dashscope\.aliyuncs\.com)\//.test(endpoint)
+            ? new Promise(resolve => GM_xmlhttpRequest({ method: 'POST', url: endpoint, anonymous: true, timeout: 15000, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + config.ai.apiKey }, data: body, onload: response => { try { const data = response.status >= 200 && response.status < 300 ? JSON.parse(response.responseText) : null; resolve(data?.choices?.[0]?.message?.content || null); } catch (_) { resolve(null); } }, onerror: () => resolve(null), ontimeout: () => resolve(null) }))
+            : fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + config.ai.apiKey }, body }).then(response => response.ok ? response.json() : null).then(data => data?.choices?.[0]?.message?.content || null).catch(() => null);
+        return request;
+    }
+
+    function openConfigPage() {
+        const config = loadConfig();
+        const overlay = document.createElement('div');
+        overlay.id = 'bom-config-overlay';
+        overlay.innerHTML = `<div class="bom-config" role="dialog" aria-modal="true" aria-labelledby="bom-config-title">
+          <div class="bom-config-head"><div><div class="bom-kicker">BING OFFICIAL MARKER</div><h1 id="bom-config-title">安全与比对配置</h1></div><button type="button" data-bom-close aria-label="关闭">×</button></div>
+          <p class="bom-note">百度认证、多引擎和 AI 都只是参考信号，最终拦截规则始终由本地安全规则决定。</p>
+          <section><h2>搜索行为</h2><label><input type="checkbox" data-bom-enabled> 启用官网标记</label><label><input type="checkbox" data-bom-unknown> 未验证结果点击前确认</label><label><input type="checkbox" data-bom-risk> 高风险链接默认拦截</label><label>缓存时间 <input type="number" min="0" max="1440" data-bom-cache> 分钟</label></section>
+          <section><h2>排除词</h2><p class="bom-note">命中排除词时不请求百度、不调用 AI，也不修改 Bing 结果。</p><div class="bom-presets"><label><input type="checkbox" data-bom-preset="weather"> 天气</label><label><input type="checkbox" data-bom-preset="news"> 新闻</label><label><input type="checkbox" data-bom-preset="lifestyle"> 生活</label><label><input type="checkbox" data-bom-preset="entertainment"> 娱乐</label><label><input type="checkbox" data-bom-preset="realtime"> 实时信息</label></div><label>自定义排除词（每行一个）<textarea rows="4" data-bom-words></textarea></label></section>
+          <section><h2>多引擎参考</h2><div class="bom-presets"><label><input type="checkbox" data-bom-engine="baidu"> 百度认证</label><label><input type="checkbox" data-bom-engine="google"> Google</label><label><input type="checkbox" data-bom-engine="duckduckgo"> DuckDuckGo</label><label><input type="checkbox" data-bom-engine="sogou"> 搜狗</label><label><input type="checkbox" data-bom-engine="so360"> 360 搜索</label></div><p class="bom-note">当前版本保存引擎偏好；跨站抓取需各引擎允许访问，默认只启用百度。</p></section>
+          <section><h2>AI 辅助比对</h2><label><input type="checkbox" data-bom-ai-enabled> 启用 AI 辅助分析</label><label>服务商 <select data-bom-ai-provider><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="qwen">通义千问</option><option value="custom">自定义 OpenAI 兼容接口</option></select></label><label>接口地址 <input type="url" data-bom-ai-url placeholder="https://api.example.com/v1"></label><label>模型 <input type="text" data-bom-ai-model placeholder="模型名称"></label><label>API Key <input type="password" data-bom-ai-key autocomplete="off" placeholder="只保存在浏览器扩展存储"></label><p class="bom-note">只发送搜索词、标题、域名和 URL，不发送网页正文。AI 不能解除本地高风险拦截。</p></section>
+          <div class="bom-actions"><button type="button" data-bom-reset>恢复默认</button><button type="button" data-bom-cancel>取消</button><button type="button" data-bom-save>保存配置</button></div><div class="bom-status" role="status" data-bom-status></div>
+        </div>`;
+        GM_addStyle(`
+          #bom-config-overlay{position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,.58);display:flex;align-items:center;justify-content:center;padding:20px;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color:#172033}
+          .bom-config{width:min(720px,100%);max-height:min(850px,calc(100vh - 40px));overflow:auto;background:#fff;border:1px solid #d7dde8;border-radius:10px;box-shadow:0 20px 60px rgba(15,23,42,.28);padding:24px}
+          .bom-config-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.bom-kicker{font-size:11px;letter-spacing:1.5px;color:#64748b;font-weight:700}.bom-config h1{font-size:25px;line-height:1.2;margin:4px 0 0}.bom-config h2{font-size:15px;margin:0 0 12px}.bom-config section{border-top:1px solid #e5e7eb;padding:18px 0}.bom-config label{display:block;margin:9px 0}.bom-config input[type=checkbox]{margin-right:8px}.bom-config input[type=text],.bom-config input[type=url],.bom-config input[type=password],.bom-config input[type=number],.bom-config select,.bom-config textarea{display:block;width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:6px;padding:9px;margin-top:5px;font:inherit}.bom-config textarea{resize:vertical}.bom-presets{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 20px}.bom-presets label{margin:4px 0}.bom-note{color:#526176;font-size:13px;margin:7px 0}.bom-actions{display:flex;justify-content:flex-end;gap:8px;padding-top:10px}.bom-actions button,.bom-config-head button{border:1px solid #cbd5e1;background:#fff;border-radius:6px;padding:9px 14px;cursor:pointer;font:inherit}.bom-actions [data-bom-save]{background:#2563eb;border-color:#2563eb;color:#fff}.bom-config-head button{font-size:22px;line-height:1;padding:4px 10px}.bom-status{min-height:20px;color:#166534;text-align:right;margin-top:8px}@media(max-width:600px){#bom-config-overlay{padding:0}.bom-config{max-height:100vh;border-radius:0;padding:18px}.bom-presets{grid-template-columns:1fr}}
+        `);
+        document.body.appendChild(overlay);
+        const $ = selector => overlay.querySelector(selector);
+        const fill = current => {
+            $('[data-bom-enabled]').checked = current.enabled;
+            $('[data-bom-unknown]').checked = current.unknownConfirmation !== false;
+            $('[data-bom-risk]').checked = current.riskBlocking !== false;
+            $('[data-bom-cache]').value = current.cacheMinutes ?? 10;
+            $('[data-bom-words]').value = current.exclusions.words.join('\n');
+            overlay.querySelectorAll('[data-bom-preset]').forEach(el => el.checked = current.exclusions.presets[el.dataset.bomPreset] !== false);
+            overlay.querySelectorAll('[data-bom-engine]').forEach(el => el.checked = current.engines[el.dataset.bomEngine] === true);
+            $('[data-bom-ai-enabled]').checked = current.ai.enabled;
+            $('[data-bom-ai-provider]').value = current.ai.provider;
+            $('[data-bom-ai-url]').value = current.ai.baseUrl;
+            $('[data-bom-ai-model]').value = current.ai.model;
+            $('[data-bom-ai-key]').value = current.ai.apiKey;
+        };
+        fill(config);
+        const close = () => overlay.remove();
+        overlay.querySelectorAll('[data-bom-close],[data-bom-cancel]').forEach(el => el.addEventListener('click', close));
+        $('[data-bom-ai-provider]').addEventListener('change', event => { const preset = AI_PROVIDERS[event.target.value]; if (preset) { $('[data-bom-ai-url]').value = preset.baseUrl; $('[data-bom-ai-model]').value = preset.model; } });
+        $('[data-bom-reset]').addEventListener('click', () => fill(defaultConfig()));
+        $('[data-bom-save]').addEventListener('click', () => {
+            const next = normalizeConfig({
+                enabled: $('[data-bom-enabled]').checked, unknownConfirmation: $('[data-bom-unknown]').checked, riskBlocking: $('[data-bom-risk]').checked,
+                cacheMinutes: Math.max(0, Math.min(1440, Number($('[data-bom-cache]').value) || 10)),
+                exclusions: { enabled: true, presets: Object.fromEntries([...overlay.querySelectorAll('[data-bom-preset]')].map(el => [el.dataset.bomPreset, el.checked])), words: $('[data-bom-words]').value.split(/\r?\n|[,，]/).map(word => word.trim()).filter(Boolean) },
+                engines: Object.fromEntries([...overlay.querySelectorAll('[data-bom-engine]')].map(el => [el.dataset.bomEngine, el.checked])),
+                ai: { enabled: $('[data-bom-ai-enabled]').checked, provider: $('[data-bom-ai-provider]').value, baseUrl: $('[data-bom-ai-url]').value.trim(), model: $('[data-bom-ai-model]').value.trim(), apiKey: $('[data-bom-ai-key]').value }
+            });
+            saveConfig(next); $('[data-bom-status]').textContent = '已保存。刷新搜索页后生效。';
+        });
+        $('[data-bom-close]').focus();
+    }
 
     function normalizeHttpUrl(value) {
         if (typeof value !== 'string' || !value.trim()) return null;
@@ -346,6 +502,8 @@
     async function main(searchId) {
         console.log('[官网补全] 脚本开始运行');
 
+        const config = loadConfig();
+
         const urlParams = new URLSearchParams(window.location.search);
         const keyword = urlParams.get('q');
         if (!keyword) {
@@ -353,8 +511,23 @@
             return;
         }
 
-        const officialLinks = await fetchBaiduOfficialLinks(keyword);
+        if (!config.enabled || shouldExcludeKeyword(keyword, config)) {
+            console.log('[官网补全] 当前搜索命中排除词或脚本已关闭');
+            return;
+        }
+
+        const officialLinks = config.engines.baidu ? await fetchBaiduOfficialLinks(keyword) : [];
         if (searchId !== activeSearchId) return;
+
+        const engineEntries = Object.entries(config.engines).filter(([engine, enabled]) => enabled && engine !== 'baidu');
+        const engineResults = await Promise.all(engineEntries.map(async ([engine]) => [engine, await fetchEngineDomains(keyword, engine)]));
+        const engineEvidence = Object.fromEntries(engineResults);
+        if (config.engines.baidu) engineEvidence.baidu = new Set(officialLinks.map(item => item.displayDomain));
+
+        const aiReview = await requestAiReview(keyword, officialLinks, config);
+        if (aiReview && searchId === activeSearchId) {
+            console.log('[官网补全] AI 辅助参考:', aiReview);
+        }
 
         const container = await waitForContainer(30000);
         if (searchId !== activeSearchId) return;
@@ -393,12 +566,19 @@
                 const extraStyle = decision.label === '高风险链接' ? { backgroundColor: '#b91c1c' }
                     : decision.label === '需确认' ? { backgroundColor: '#FF8C00' }
                     : decision.label === '未验证' ? { backgroundColor: '#6b7280' } : {};
-                titleContainer.appendChild(createTag(decision.label, title, extraStyle));
+                const evidence = summarizeEngineEvidence(link.href, engineEvidence);
+                const evidenceTitle = evidence.matches > 1 ? `${title}；${evidence.label}（${evidence.matches} 个引擎）` : title;
+                titleContainer.appendChild(createTag(decision.label, evidenceTitle, extraStyle));
             }
-            installNavigationGuard(link, getResultDecision(link.href, matched, matchType), matched && matched.url);
+            const decision = getResultDecision(link.href, matched, matchType);
+            if (decision.label === '未验证' && config.unknownConfirmation === false) decision.requiresConfirmation = false;
+            if (decision.level === 'high-risk' && config.riskBlocking === false) decision.requiresConfirmation = false;
+            installNavigationGuard(link, decision, matched && matched.url);
             item.querySelectorAll('a[href]').forEach((anchor) => {
                 if (anchor === link) return;
                 const decision = getResultDecision(anchor.href, null, 'none');
+                if (decision.label === '未验证' && config.unknownConfirmation === false) decision.requiresConfirmation = false;
+                if (decision.level === 'high-risk' && config.riskBlocking === false) decision.requiresConfirmation = false;
                 installNavigationGuard(anchor, decision, null);
             });
             if (matched) {
@@ -465,9 +645,11 @@
     }
 
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision };
+        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision, defaultConfig, normalizeConfig, aiProviderPresets, exclusionPresetWords, shouldExcludeKeyword, summarizeEngineEvidence };
         return;
     }
+
+    GM_registerMenuCommand('打开官网标记配置', openConfigPage);
 
     // ==================== 启动与监听（支持无刷新搜索） ====================
 

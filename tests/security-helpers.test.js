@@ -45,3 +45,49 @@ test('requires confirmation for a high-risk result even without a Baidu match', 
 test('does not call an HTTP reference an exact trusted match', () => {
   assert.equal(api.getMatchType('https://example.com', 'http://example.com'), 'none');
 });
+
+test('ships useful exclusion presets for live and lifestyle searches', () => {
+  const config = api.defaultConfig();
+  assert.equal(config.exclusions.presets.weather, true);
+  assert.equal(config.exclusions.presets.news, true);
+  assert.ok(api.exclusionPresetWords().weather.includes('天气'));
+  assert.ok(api.exclusionPresetWords().lifestyle.includes('菜谱'));
+  assert.ok(api.shouldExcludeKeyword('北京天气', config));
+  assert.ok(api.shouldExcludeKeyword('最新新闻', config));
+  assert.equal(api.shouldExcludeKeyword('汽水音乐 官网', config), false);
+});
+
+test('respects disabled exclusion presets while keeping custom words', () => {
+  const config = api.defaultConfig();
+  config.exclusions.presets.weather = false;
+  config.exclusions.words.push('我的项目');
+  assert.equal(api.shouldExcludeKeyword('北京天气', config), false);
+  assert.equal(api.shouldExcludeKeyword('我的项目官网', config), true);
+});
+
+test('provides safe AI provider presets without an API key', () => {
+  const providers = api.aiProviderPresets();
+  assert.equal(providers.openai.baseUrl, 'https://api.openai.com/v1');
+  assert.equal(providers.deepseek.baseUrl, 'https://api.deepseek.com/v1');
+  assert.equal(providers.qwen.baseUrl, 'https://dashscope.aliyuncs.com/compatible-mode/v1');
+  assert.equal(providers.openai.apiKey, '');
+});
+
+test('normalizes imported config and never invents an API key', () => {
+  const config = api.normalizeConfig({ ai: { enabled: true, provider: 'deepseek' } });
+  assert.equal(config.ai.enabled, true);
+  assert.equal(config.ai.provider, 'deepseek');
+  assert.equal(config.ai.apiKey, '');
+  assert.equal(config.engines.baidu, true);
+});
+
+test('summarizes multi-engine evidence without upgrading trust', () => {
+  const result = api.summarizeEngineEvidence('https://www.example.com/path', {
+    baidu: new Set(['example.com']),
+    google: new Set(['example.com']),
+    duckduckgo: new Set(['other.example'])
+  });
+  assert.equal(result.matches, 2);
+  assert.equal(result.label, '多引擎参考');
+  assert.equal(result.trusted, false);
+});
