@@ -113,10 +113,42 @@
         return new Promise((resolve, reject) => GM_xmlhttpRequest({ method: 'GET', url: endpoint, anonymous: true, timeout: 15000, headers: { Authorization: 'Bearer ' + config.ai.apiKey }, onload: response => { try { if (response.status < 200 || response.status >= 300) throw new Error('HTTP ' + response.status); resolve(extractModelIds(JSON.parse(response.responseText))); } catch (error) { reject(error); } }, onerror: () => reject(new Error('模型列表请求失败')), ontimeout: () => reject(new Error('模型列表请求超时')) }));
     }
 
+    // 解析参考引擎的结果链接为真实目标域名：遇包壳跳转(如 360 的 /link?m=、搜狗 /link?url=)则跟随重定向取 finalUrl
+    function resolveRealHost(rawHref, baseUrl) {
+        let parsed = null;
+        try { parsed = new URL(rawHref, baseUrl); } catch (_) { return Promise.resolve(''); }
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return Promise.resolve('');
+        const wrapped = /(^|\.)(google\.com|duckduckgo\.com|sogou\.com|so\.com|so\.toutiao\.com|sm\.cn|baidu\.com)$/i.test(parsed.hostname);
+        if (!wrapped) return Promise.resolve(parsed.hostname); // 已是真实目标
+        if (parsed.protocol !== 'https:') return Promise.resolve(''); // 包壳站需 https，降级跳过
+        return new Promise(resolve => GM_xmlhttpRequest({
+            method: 'GET', url: parsed.href, anonymous: true, timeout: 7000,
+            onload: r => { try { resolve(new URL(r.finalUrl || r.responseURL || parsed.href).hostname); } catch (_) { resolve(''); } },
+            onerror: () => resolve(''), ontimeout: () => resolve('')
+        }));
+    }
+
     function fetchEngineDomains(keyword, engine) {
         const urls = { google: `https://www.google.com/search?q=${encodeURIComponent(keyword)}`, duckduckgo: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(keyword)}`, sogou: `https://www.sogou.com/web?query=${encodeURIComponent(keyword)}`, so360: `https://www.so.com/s?q=${encodeURIComponent(keyword)}`, toutiao: `https://www.so.toutiao.com/search?keyword=${encodeURIComponent(keyword)}`, quark: `https://quark.sm.cn/s?q=${encodeURIComponent(keyword)}` };
-        if (!urls[engine]) return Promise.resolve(new Set());
-        return new Promise(resolve => GM_xmlhttpRequest({ method: 'GET', url: urls[engine], anonymous: true, timeout: 10000, onload: response => { if (response.status !== 200) return resolve(new Set()); const domains = new Set(); const parser = new DOMParser(); const doc = parser.parseFromString(response.responseText, 'text/html'); doc.querySelectorAll('a[href]').forEach(anchor => { const parsed = normalizeHttpUrl(anchor.href); if (parsed && parsed.protocol === 'https:') domains.add(parsed.hostname); }); resolve(domains); }, onerror: () => resolve(new Set()), ontimeout: () => resolve(new Set()) }));
+        const base = urls[engine];
+        if (!base) return Promise.resolve(new Set());
+        return new Promise(resolve => GM_xmlhttpRequest({
+            method: 'GET', url: base, anonymous: true, timeout: 10000,
+            onload: async response => {
+                const hosts = new Set();
+                if (response.status !== 200) return resolve(hosts);
+                const doc = new DOMParser().parseFromString(response.responseText, 'text/html');
+                const anchors = [...doc.querySelectorAll('a[href]')];
+                let iter = 0;
+                for (const anchor of anchors) {
+                    if (iter++ >= 25 || hosts.size >= 15) break; // 限制跟随量与结果数，避免请求过多
+                    const host = await resolveRealHost(anchor.getAttribute('href') || '', base);
+                    if (host) hosts.add(host);
+                }
+                resolve(hosts);
+            },
+            onerror: () => resolve(new Set()), ontimeout: () => resolve(new Set())
+        }));
     }
 
     function shouldExcludeKeyword(keyword, config) {
