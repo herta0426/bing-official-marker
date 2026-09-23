@@ -11,6 +11,8 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @connect      www.baidu.com
+// @connect      wappass.baidu.com
+// @connect      verify.baidu.com
 // @connect      api.openai.com
 // @connect      api.deepseek.com
 // @connect      dashscope.aliyuncs.com
@@ -344,11 +346,20 @@
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: url,
-                anonymous: true,
                 timeout: 10000,
+                followRedirects: false,
                 onload: function(response) {
-                    if (response.status !== 200 || response.responseText.length < 5000) {
-                        console.warn('[官网补全] 百度返回异常或过短');
+                    const finalUrl = response.finalUrl || url;
+                    const blockedToCaptcha = response.status >= 300 || /wappass|安全验证|captcha|verify/i.test(finalUrl);
+                    if (response.status !== 200 || response.responseText.length < 5000 || blockedToCaptcha) {
+                        if (blockedToCaptcha) {
+                            console.warn('[官网补全] 百度触发了 wappass 安全验证，本次抓取被拦截。可在浏览器中先打开一个百度页面手动过码，再回到 Bing 刷新，通常一段时间内可正常获取官网。', finalUrl);
+                            bomCaptchaUrl = pickCaptchaSource(extractRedirectUrl(response.headers));
+                            bomFallbackUrl = BAIDU_SEARCH_URL + encodeURIComponent(keyword);
+                            showVerifyBanner();
+                        } else {
+                            console.warn('[官网补全] 百度返回异常或过短', response.status, finalUrl);
+                        }
                         resolve([]);
                         return;
                     }
@@ -436,6 +447,114 @@
                 }
             });
         });
+    }
+
+    // ==================== 百度验证被拦时的提示条 + 重试 ====================
+    let bomVerifying = false;
+    let bomLastRetryAt = 0;
+    let bomCaptchaUrl = '';
+    let bomFallbackUrl = '';
+    const BOM_BANNER_STYLE = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);' +
+        'z-index:2147483000;max-width:calc(100vw - 32px);box-sizing:border-box;' +
+        'display:flex;align-items:center;gap:8px;flex-wrap:wrap;' +
+        'padding:8px 12px;border:1px solid #f5d078;border-radius:6px;' +
+        'background:#fffbe6;color:#6b4f08;font:13px/1.5 system-ui,"Segoe UI",sans-serif;';
+
+    function extractRedirectUrl(headers) {
+        const lines = String(headers || '').split(/\r?\n/);
+        for (const line of lines) {
+            const idx = line.indexOf(':');
+            if (idx < 0) continue;
+            if (line.slice(0, idx).trim().toLowerCase() === 'location') {
+                return line.slice(idx + 1).trim();
+            }
+        }
+        return '';
+    }
+
+    // 只优先使用"看起来像验证页"的地址（百度下发的真实挑战），否则回退到首页重新触发验证
+    function pickCaptchaSource(location) {
+        try {
+            const url = new URL(location);
+            if (/wappass|verify|captcha|qrcode|passport|security|tuxing/i.test(url.hostname + url.pathname)) return url.href;
+        } catch (_) { /* 非 URL 则忽略 */ }
+        return '';
+    }
+
+    function showVerifyBanner() {
+        if (bomVerifying && document.getElementById('bom-verify-banner')) return;
+        bomVerifying = true;
+        const old = document.getElementById('bom-verify-banner');
+        if (old) old.remove();
+
+        const bar = document.createElement('div');
+        bar.id = 'bom-verify-banner';
+        bar.style.cssText = BOM_BANNER_STYLE;
+        const text = document.createElement('span');
+        text.textContent = '百度安全验证拦截，未能获取官网数据。请先完成验证后再重试。';
+        bar.appendChild(text);
+
+        const goBtn = document.createElement('button');
+        goBtn.type = 'button';
+        goBtn.textContent = '去完成百度验证';
+        goBtn.style.cssText = 'border:1px solid #c2981f;border-radius:4px;background:#fff;padding:3px 10px;cursor:pointer;font:inherit;';
+        goBtn.onclick = () => {
+            const url = bomCaptchaUrl || bomFallbackUrl || 'https://www.baidu.com';
+            // 优先开真正的独立弹窗（带尺寸串，才能用 win.closed 感知关闭并做"过码后回调"）
+            let win = null;
+            try {
+                win = window.open(url, 'bomVerify', 'popup=1,width=900,height=660,left=120,top=80,resizable=yes,scrollbars=yes,status=yes');
+            } catch (_) { /* ignore */ }
+            if (win) {
+                watchPopupClose(win);
+                return;
+            }
+            // 弹窗被拦，回退为新标签页（仍是 window.open，仅目标不同）
+            win = window.open(url, '_blank');
+            if (!win) {
+                goBtn.textContent = '弹出窗口被拦截，请在本站放行弹窗后重试';
+                goBtn.style.borderColor = '#b91c1c';
+                console.warn('[官网补全] 浏览器拦截了弹窗，请在站点设置允许 bing.com 弹窗后再次点击');
+                return;
+            }
+            watchPopupClose(win);
+        };
+        bar.appendChild(goBtn);
+
+        const retryBtn = document.createElement('button');
+        retryBtn.type = 'button';
+        retryBtn.id = 'bom-verify-retry';
+        retryBtn.textContent = '重试';
+        retryBtn.style.cssText = 'border:1px solid #c2981f;border-radius:4px;background:#fff;padding:3px 10px;cursor:pointer;font:inherit;';
+        retryBtn.onclick = () => triggerBaiduRetry();
+        bar.appendChild(retryBtn);
+
+        document.body.appendChild(bar);
+    }
+
+    function watchPopupClose(win) {
+        const timer = setInterval(() => {
+            if (win.closed) {
+                clearInterval(timer);
+                console.log('[官网补全] 验证窗口已关闭，自动重试抓取');
+                triggerBaiduRetry();
+            }
+        }, 500);
+        // 兜底：超过 10 分钟未关闭就不再轮询，避免泄漏
+        setTimeout(() => clearInterval(timer), 10 * 60 * 1000);
+    }
+
+    function triggerBaiduRetry() {
+        const now = Date.now();
+        if (now - bomLastRetryAt < 3000) return; // 防抖，防止连续点击造成连环请求
+        bomLastRetryAt = now;
+        const bar = document.getElementById('bom-verify-banner');
+        if (bar) bar.remove();
+        bomVerifying = false;
+        // 清理上一次结果后重新抓取并标记（与 runScript 的清理保持一致）
+        document.querySelectorAll('[data-bom-tag="true"]').forEach(el => el.remove());
+        document.querySelectorAll('li[data-bom-injected="true"]').forEach(el => el.remove());
+        main(++activeSearchId);
     }
 
     function createTag(label, title, extraStyle) {
