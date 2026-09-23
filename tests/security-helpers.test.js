@@ -74,11 +74,22 @@ test('provides safe AI provider presets without an API key', () => {
 });
 
 test('normalizes imported config and never invents an API key', () => {
-  const config = api.normalizeConfig({ ai: { enabled: true, provider: 'deepseek' } });
+  const config = api.normalizeConfig({ version: 2, ai: { enabled: true, provider: 'deepseek' } });
   assert.equal(config.ai.enabled, true);
   assert.equal(config.ai.provider, 'deepseek');
   assert.equal(config.ai.apiKey, '');
   assert.equal(config.engines.baidu, true);
+  assert.equal(config.engines.so360, true); // 国内可用中文引擎默认开启
+  assert.equal(config.engines.toutiao, true);
+  assert.equal(config.engines.quark, false); // 神马/夸克禁用
+});
+
+test('版本不符的旧配置自动回落到最新默认', () => {
+  const stale = { version: 1, protectionMode: 'download', engines: { baidu: true, so360: false } };
+  const config = api.normalizeConfig(stale);
+  assert.equal(config.protectionMode, 'mark'); // 回落默认
+  assert.equal(config.engines.so360, true); // 新默认生效
+  assert.deepStrictEqual(config, api.defaultConfig()); // 与默认完全一致
 });
 
 test('summarizes multi-engine evidence without upgrading trust', () => {
@@ -111,9 +122,26 @@ test('detects downloadable result URLs', () => {
   assert.equal(api.isDownloadUrl('https://example.com/file.zip', api.defaultConfig()), true);
 });
 
-test('uses download mode to avoid prompts for ordinary searches', () => {
+test('默认已禁用下载保护（mark 模式不弹确认）', () => {
   const config = api.defaultConfig();
+  assert.equal(config.protectionMode, 'mark');
+  assert.equal(api.shouldConfirmNavigation('https://unknown.example/download/app.exe', null, 'none', '普通搜索', config), false);
+  assert.equal(api.shouldConfirmNavigation('https://unknown.example/article', null, 'none', '某软件下载', config), false);
+});
+
+test('开启下载保护模式后仍会下载链接/意图弹确认', () => {
+  const config = api.defaultConfig();
+  config.protectionMode = 'download';
   assert.equal(api.shouldConfirmNavigation('https://unknown.example/article', null, 'none', '普通搜索', config), false);
   assert.equal(api.shouldConfirmNavigation('https://unknown.example/download/app.exe', null, 'none', '普通搜索', config), true);
   assert.equal(api.shouldConfirmNavigation('https://unknown.example/article', null, 'none', '某软件下载', config), true);
+});
+
+test('去除下载意图词得到参考词（如 "qq 下载" → "qq"）', () => {
+  const config = api.defaultConfig();
+  assert.equal(api.stripDownloadKeywords('qq 下载', config), 'qq');
+  assert.equal(api.stripDownloadKeywords('qq下载', config), 'qq');
+  assert.equal(api.stripDownloadKeywords('微信PC版官方安装包', config), '微信 官方');
+  assert.equal(api.stripDownloadKeywords('普通新闻', config), '普通新闻');
+  assert.equal(api.stripDownloadKeywords('下载', config), '下载'); // 全被删时回退原词
 });
