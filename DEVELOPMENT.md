@@ -28,6 +28,12 @@ Bing 搜索页加载 / SPA 导航 / MutationObserver
 | `registerVerification` / `showVerifyBanner` / `triggerVerifyRetry` | 安全验证提示条（百度/360/搜狗/头条通用）+ 一键开验证页 + 关窗自动重试，focus 自动重试**已移除** |
 | `isVerificationResponse` / `looksLikeChallenge` / `pickCaptchaSource` | 识别引擎是否被验证拦截（3xx 跳挑战页 / 小体积验证页正文），并从 `Location` 取出真实挑战地址 |
 
+## 元数据块（UserScript header）
+
+按 Tampermonkey 规范补全：`@namespace` 用仓库地址（原先是 TM 占位符 `http://tampermonkey.net/`）、`@license MIT`、`@homepageURL`/`@supportURL`、`@downloadURL`/`@updateURL` 指向 `main` 的 raw 地址（自动更新）、`@run-at document-idle`（与 TM 默认一致，显式写出）、`@noframes`。`@grant` 只列真正用到的 5 个 API：`GM_xmlhttpRequest`/`GM_addStyle`/`GM_getValue`/`GM_setValue`/`GM_registerMenuCommand`。
+
+> **改 `@namespace` 的代价**：TM 以 `@namespace`+`@name` 识别脚本，改动后已装旧版的用户升级时可能被当成新脚本，**GM 存储里的配置（`bom-config`）会回到默认**，需要重新设置一次。发布后不要再改。
+
 ## 跨域白名单（@connect）
 
 `www.baidu.com`、`wappass.baidu.com`、`verify.baidu.com`、`www.sogou.com`、`www.so.com`、`qcaptcha.so.com`、`www.so.toutiao.com`、`www.sm.cn`、`m.sm.cn`、`quark.sm.cn`、`www.google.com`、`html.duckduckgo.com`、`api.openai.com`、`api.deepseek.com`、`dashscope.aliyuncs.com`

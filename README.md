@@ -36,7 +36,8 @@
 1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/)（Chrome/Edge）。
 2. 安装脚本（或新建脚本粘贴源码）：
    - [安装脚本（GitHub）](https://github.com/herta0426/bing-official-marker/raw/refs/heads/main/baidudreamourbings.user.js)
-3. 首次使用会请求跨域授权（`www.baidu.com`、`www.sogou.com`、`www.so.com`、`www.so.toutiao.com`、`quark.sm.cn`），请点**允许**，否则脚本不会注入运行。
+   - 脚本已配置 `@updateURL` / `@downloadURL` 指向 main，之后 Tampermonkey 会自动检查更新。
+3. 首次使用会请求跨域授权（`www.baidu.com`、`wappass.baidu.com`、`www.sogou.com`、`www.so.com`、`qcaptcha.so.com`、`www.so.toutiao.com` 等），请点**允许**，否则对应引擎的请求会被拦截、脚本静默少拿到证据。
 4. 访问 `https://cn.bing.com/search?q=强调`，约 1~3 秒完成标记/补充。
 
 ### 配置中心
