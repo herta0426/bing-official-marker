@@ -1,10 +1,17 @@
 // ==UserScript==
 // @name         BaiduDreamourBings
-// @namespace    http://tampermonkey.net/
+// @namespace    https://github.com/herta0426/bing-official-marker
 // @version      1.1
-// @description  通过提取百度结果页获取官网 URL
+// @description  在必应搜索结果中标记/补全官网（百度等国内引擎交叉校验），并拦截可疑下载链接
 // @author       herta0426
+// @license      MIT
+// @homepageURL  https://github.com/herta0426/bing-official-marker
+// @supportURL   https://github.com/herta0426/bing-official-marker/issues
+// @downloadURL  https://raw.githubusercontent.com/herta0426/bing-official-marker/main/baidudreamourbings.user.js
+// @updateURL    https://raw.githubusercontent.com/herta0426/bing-official-marker/main/baidudreamourbings.user.js
 // @match        https://*.bing.com/search?*
+// @run-at       document-idle
+// @noframes
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_getValue
