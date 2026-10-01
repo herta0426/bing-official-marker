@@ -145,3 +145,39 @@ test('去除下载意图词得到参考词（如 "qq 下载" → "qq"）', () =>
   assert.equal(api.stripDownloadKeywords('普通新闻', config), '普通新闻');
   assert.equal(api.stripDownloadKeywords('下载', config), '下载'); // 全被删时回退原词
 });
+
+test('识别引擎的人机验证挑战页', () => {
+  // 360 实测下发的真实挑战地址（http + qcaptcha）
+  const so360 = 'http://qcaptcha.so.com/?ret=https%3A%2F%2Fwww.so.com%2Fs%3Fq%3D%25E9%259F%25B3%25E4%25B9%2590%26src%3Dcaptcha&tk=00d15352';
+  assert.equal(api.looksLikeChallenge(so360), true);
+  assert.equal(api.looksLikeChallenge('https://wappass.baidu.com/static/captcha/tuxing.html'), true);
+  assert.equal(api.looksLikeChallenge('https://www.so.com/s?q=%E9%9F%B3%E4%B9%90'), false);
+  assert.equal(api.looksLikeChallenge(''), false);
+  // 搜狗的挑战页挂在已白名单的 www.sogou.com 上，只能靠路径段 antispider 识别
+  const sogou = 'https://www.sogou.com/antispider/?m=1&antip=web_hd&from=%2Fweb%3Fquery%3D11111';
+  assert.equal(api.looksLikeChallenge(sogou), true);
+  assert.equal(api.looksLikeChallenge('https://www.sogou.com/web?query=11111'), false);
+  assert.equal(api.pickCaptchaSource(sogou), sogou);
+  // 只取挑战页地址，普通跳转地址一律丢弃（回退到引擎首页）
+  assert.equal(api.pickCaptchaSource(so360), so360);
+  assert.equal(api.pickCaptchaSource('https://www.so.com/link?m=abc'), '');
+  assert.equal(api.pickCaptchaSource(''), '');
+});
+
+test('把验证跳转与验证页正文判定为拦截', () => {
+  const location360 = 'http://qcaptcha.so.com/?ret=x&tk=y';
+  assert.equal(api.isVerificationResponse({ status: 302, responseText: '' }, 'https://www.so.com/s?q=x', location360), true);
+  // 3xx 但目标是普通地址 → 不算验证拦截
+  assert.equal(api.isVerificationResponse({ status: 302, responseText: '' }, 'https://www.so.com/s?q=x', 'https://m.so.com/s?q=x'), false);
+  // 普通 200 搜索结果页 → 放行
+  assert.equal(api.isVerificationResponse({ status: 200, responseText: '<html>' + 'x'.repeat(30000) + '</html>' }, 'https://www.so.com/s?q=x', ''), false);
+  // 200 但正文是验证页 → 拦截
+  assert.equal(api.isVerificationResponse({ status: 200, responseText: '<title>访问异常页面</title>' }, 'https://www.so.com/s?q=x', ''), true);
+  // Tampermonkey 忽略 followRedirects:false 跟随后：200 + finalUrl 落在挑战页 → 同样要拦截
+  assert.equal(api.isVerificationResponse({ status: 200, responseText: '<html>captcha</html>' }, 'http://qcaptcha.so.com/?ret=x&tk=y', ''), true);
+  // 搜狗：跟随后 finalUrl 落在 antispider
+  assert.equal(api.isVerificationResponse({ status: 200, responseText: '<html>antispider</html>' }, 'https://www.sogou.com/antispider/?m=1&antip=web_hd', ''), true);
+  // 搜狗正常结果页 → 放行
+  assert.equal(api.isVerificationResponse({ status: 200, responseText: 'y'.repeat(30000) }, 'https://www.sogou.com/web?query=x', ''), false);
+  assert.equal(api.isVerificationResponse({ status: 500, responseText: 'boom' }, 'https://www.so.com/s?q=x', ''), false);
+});
