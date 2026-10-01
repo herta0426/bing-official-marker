@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BaiduDreamourBings
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  通过提取百度结果页获取官网 URL
 // @author       herta0426
 // @match        https://*.bing.com/search?*
@@ -20,6 +20,7 @@
 // @connect      html.duckduckgo.com
 // @connect      www.sogou.com
 // @connect      www.so.com
+// @connect      qcaptcha.so.com
 // @connect      www.so.toutiao.com
 // @connect      www.sm.cn
 // @connect      m.sm.cn
@@ -53,6 +54,32 @@
     };
     const DEFAULT_DOWNLOAD_KEYWORDS = ['下载', '安装包', '软件', '客户端', '驱动', '固件', 'apk', 'exe', 'msi', 'iso', '破解', '汉化版', '绿色版', '便携版', '最新版', '官方安装', 'pc版', 'windows版', 'mac版', '安卓版', 'ios版', 'download', 'installer', 'setup', 'driver', 'firmware', 'portable', 'crack', 'patched'];
     const DEFAULT_DOWNLOAD_EXTENSIONS = ['.exe', '.msi', '.apk', '.dmg', '.zip', '.rar', '.7z', '.iso', '.deb', '.pkg'];
+
+    // 会被安全验证拦截的参考引擎：请求携带浏览器既有 cookie，并在被拦时走"提示条 → 过码 → 关窗重试"兜底。
+    // 只有带 cookie 的请求才能在用户过码后复用验证结果，匿名请求过码无效。
+    const ENGINE_VERIFY = {
+        baidu:   { label: '百度', host: 'baidu.com',      home: 'https://www.baidu.com/' },
+        so360:   { label: '360',  host: 'so.com',         home: 'https://www.so.com/' },
+        sogou:   { label: '搜狗', host: 'sogou.com',      home: 'https://www.sogou.com/' },
+        toutiao: { label: '头条', host: 'so.toutiao.com', home: 'https://www.so.toutiao.com/' }
+    };
+
+    function usesEngineCookies(hostname) {
+        const host = String(hostname || '').toLowerCase();
+        return Object.values(ENGINE_VERIFY).some(item => host === item.host || host.endsWith('.' + item.host));
+    }
+
+    // 判断一个地址是否像人机验证挑战页：
+    // 360 的 qcaptcha.so.com、百度的 wappass.baidu.com、搜狗的 www.sogou.com/antispider/
+    function looksLikeChallenge(value) {
+        const raw = String(value || '');
+        try {
+            const url = new URL(raw);
+            return /wappass|qcaptcha|captcha|verify|qrcode|passport|security|tuxing|punish|antispider/i.test(url.hostname + url.pathname);
+        } catch (_) {
+            return /wappass|qcaptcha|captcha|verify|punish|antispider/i.test(raw);
+        }
+    }
 
     function defaultConfig() {
         return {
@@ -122,21 +149,44 @@
         if (!wrapped) return Promise.resolve(parsed.hostname); // 已是真实目标
         if (parsed.protocol !== 'https:') return Promise.resolve(''); // 包壳站需 https，降级跳过
         return new Promise(resolve => GM_xmlhttpRequest({
-            method: 'GET', url: parsed.href, anonymous: true, timeout: 7000,
+            // 包壳跳转发生在国内引擎域上，同样携带 cookie，避免跳转也撞验证
+            method: 'GET', url: parsed.href, anonymous: !usesEngineCookies(parsed.hostname), timeout: 7000,
             onload: r => { try { resolve(new URL(r.finalUrl || r.responseURL || parsed.href).hostname); } catch (_) { resolve(''); } },
             onerror: () => resolve(''), ontimeout: () => resolve('')
         }));
+    }
+
+    // 参考引擎响应是否被人机验证拦截：Location/finalUrl 落到挑战页，或小体积的验证页正文。
+    // 注意 Tampermonkey 会忽略 followRedirects:false 直接跟随跳转，所以必须同时看 finalUrl。
+    function isVerificationResponse(response, finalUrl, location) {
+        if (looksLikeChallenge(location) || looksLikeChallenge(finalUrl)) return true;
+        if (response.status !== 200) return false;
+        const text = String(response.responseText || '');
+        return text.length < 20000 && /访问异常页面|安全验证|人机验证|滑动验证|拖动滑块|访问过于频繁|请输入.{0,8}验证码/i.test(text);
     }
 
     function fetchEngineDomains(keyword, engine) {
         const urls = { google: `https://www.google.com/search?q=${encodeURIComponent(keyword)}`, duckduckgo: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(keyword)}`, sogou: `https://www.sogou.com/web?query=${encodeURIComponent(keyword)}`, so360: `https://www.so.com/s?q=${encodeURIComponent(keyword)}`, toutiao: `https://www.so.toutiao.com/search?keyword=${encodeURIComponent(keyword)}`, quark: `https://quark.sm.cn/s?q=${encodeURIComponent(keyword)}` };
         const base = urls[engine];
         if (!base) return Promise.resolve(new Set());
+        const managed = Boolean(ENGINE_VERIFY[engine]); // 国内引擎：携带 cookie + 验证兜底
         return new Promise(resolve => GM_xmlhttpRequest({
-            method: 'GET', url: base, anonymous: true, timeout: 10000,
+            // followRedirects 关闭：被验证拦截时保留 3xx 与 Location，才能取到真实挑战地址（与百度一致）
+            method: 'GET', url: base, anonymous: !managed, followRedirects: !managed, timeout: 10000,
             onload: async response => {
                 const hosts = new Set();
-                if (response.status !== 200) return resolve(hosts);
+                const finalUrl = response.finalUrl || base;
+                const location = extractRedirectUrl(response.headers);
+                if (managed && isVerificationResponse(response, finalUrl, location)) {
+                    const challenge = pickCaptchaSource(location, base) || pickCaptchaSource(finalUrl, base);
+                    console.warn('[官网补全] ' + ENGINE_VERIFY[engine].label + ' 触发安全验证，本次参考抓取被拦截：', challenge || location || finalUrl);
+                    registerVerification(engine, challenge, base);
+                    return resolve(hosts);
+                }
+                if (response.status !== 200) {
+                    console.warn('[官网补全] ' + engine + ' 返回异常状态:', response.status, finalUrl);
+                    return resolve(hosts);
+                }
                 const doc = new DOMParser().parseFromString(response.responseText, 'text/html');
                 const anchors = [...doc.querySelectorAll('a[href]')];
                 let iter = 0;
@@ -147,7 +197,12 @@
                 }
                 resolve(hosts);
             },
-            onerror: () => resolve(new Set()), ontimeout: () => resolve(new Set())
+            onerror: err => {
+                // 跳转落到 @connect 未覆盖的域名时 TM 会直接报错，这里至少留下可诊断的日志
+                if (managed) console.warn('[官网补全] ' + ENGINE_VERIFY[engine].label + ' 请求被中断（可能是验证跳转到了未授权域名）:', err && err.error);
+                resolve(new Set());
+            },
+            ontimeout: () => resolve(new Set())
         }));
     }
 
@@ -230,7 +285,7 @@
           <p class="bom-note">百度认证、多引擎和 AI 都只是参考信号，最终拦截规则始终由本地安全规则决定。</p>
           <section><details class="bom-collapse" open><summary><h2>搜索行为</h2></summary><label><input type="checkbox" data-bom-enabled> 启用官网标记</label><label>保护模式 <select data-bom-mode><option value="download">下载保护（推荐）</option><option value="strict">严格保护</option><option value="mark">仅标记</option></select></label><label><input type="checkbox" data-bom-risk> 高风险链接始终拦截</label><label class="bom-inline">缓存时间 <input type="number" min="0" max="1440" data-bom-cache> 分钟</label><label>下载意图关键词（每行一个）<textarea rows="4" data-bom-download-words></textarea></label><label>下载扩展名（每行一个）<textarea rows="2" data-bom-download-exts></textarea></label></details></section>
           <section><details class="bom-collapse" open><summary><h2>排除词</h2></summary><p class="bom-note">命中排除词时不请求百度、不调用 AI，也不修改 Bing 结果。</p><div class="bom-presets"><label><input type="checkbox" data-bom-preset="weather"> 天气</label><label><input type="checkbox" data-bom-preset="news"> 新闻</label><label><input type="checkbox" data-bom-preset="lifestyle"> 生活</label><label><input type="checkbox" data-bom-preset="entertainment"> 娱乐</label><label><input type="checkbox" data-bom-preset="realtime"> 实时信息</label></div><label>自定义排除词（每行一个）<textarea rows="4" data-bom-words></textarea></label></details></section>
-          <section><details class="bom-collapse" open><summary><h2>多引擎参考</h2></summary><div class="bom-presets"><label><input type="checkbox" data-bom-engine="baidu"> 百度认证</label><label><input type="checkbox" data-bom-engine="google"> Google</label><label><input type="checkbox" data-bom-engine="duckduckgo"> DuckDuckGo</label><label><input type="checkbox" data-bom-engine="sogou"> 搜狗</label><label><input type="checkbox" data-bom-engine="so360"> 360 搜索</label><label><input type="checkbox" data-bom-engine="toutiao"> 头条搜索</label><label><input type="checkbox" data-bom-engine="quark" disabled title="验证问题暂无法适配"> 神马搜索<span style="opacity:.6">（验证问题暂无法适配）</span></label></div><p class="bom-note">当前版本保存引擎偏好；跨站抓取需各引擎允许访问，默认只启用百度。神马/夸克因验证模块适配问题已禁用。</p></details></section>
+          <section><details class="bom-collapse" open><summary><h2>多引擎参考</h2></summary><div class="bom-presets"><label><input type="checkbox" data-bom-engine="baidu"> 百度认证</label><label><input type="checkbox" data-bom-engine="google"> Google</label><label><input type="checkbox" data-bom-engine="duckduckgo"> DuckDuckGo</label><label><input type="checkbox" data-bom-engine="sogou"> 搜狗</label><label><input type="checkbox" data-bom-engine="so360"> 360 搜索</label><label><input type="checkbox" data-bom-engine="toutiao"> 头条搜索</label><label><input type="checkbox" data-bom-engine="quark" disabled title="验证问题暂无法适配"> 神马搜索<span style="opacity:.6">（验证问题暂无法适配）</span></label></div><p class="bom-note">国内引擎（百度/360/搜狗/头条）抓取时携带浏览器既有 cookie；若被安全验证拦截，页面顶部会出现提示条，过码关窗后自动重试。神马/夸克因验证模块适配问题已禁用。</p></details></section>
           <section><details class="bom-collapse"><summary><h2>AI 辅助比对</h2></summary><label><input type="checkbox" data-bom-ai-enabled> 启用 AI 辅助分析</label><label>服务商 <select data-bom-ai-provider><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="qwen">通义千问</option><option value="custom">自定义 OpenAI 兼容接口</option></select></label><label>接口地址 <input type="url" data-bom-ai-url placeholder="https://api.example.com/v1"></label><label>API Key <input type="password" data-bom-ai-key autocomplete="off" placeholder="只保存在浏览器扩展存储"></label><label>模型 <select data-bom-ai-model-select data-bom-model-select><option value="custom">自定义</option></select></label><button type="button" data-bom-fetch-models>获取模型列表</button><label data-bom-custom-model hidden>自定义模型 <input type="text" data-bom-ai-model-custom placeholder="输入模型名称"></label><p class="bom-model-status" data-bom-model-status></p><p class="bom-note">只发送搜索词、标题、域名和 URL，不发送网页正文。AI 不能解除本地高风险拦截。</p></details></section>
           <div class="bom-actions"><button type="button" data-bom-reset>恢复默认</button><button type="button" data-bom-cancel>取消</button><button type="button" data-bom-save>保存配置</button></div><div class="bom-status" role="status" data-bom-status></div>
         </div>`;
@@ -269,6 +324,7 @@
         $('[data-bom-reset]').addEventListener('click', () => fill(defaultConfig()));
         $('[data-bom-save]').addEventListener('click', () => {
             const next = normalizeConfig({
+                version: config.version,
                 enabled: $('[data-bom-enabled]').checked, protectionMode: $('[data-bom-mode]').value, alwaysBlockRisk: $('[data-bom-risk]').checked,
                 cacheMinutes: Math.max(0, Math.min(1440, Number($('[data-bom-cache]').value) || 10)),
                 downloadKeywords: $('[data-bom-download-words]').value.split(/\r?\n|[,，]/).map(word => word.trim()).filter(Boolean),
@@ -409,9 +465,7 @@
                     if (response.status !== 200 || response.responseText.length < 5000 || blockedToCaptcha) {
                         if (blockedToCaptcha) {
                             console.warn('[官网补全] 百度触发了 wappass 安全验证，本次抓取被拦截。可在浏览器中先打开一个百度页面手动过码，再回到 Bing 刷新，通常一段时间内可正常获取官网。', finalUrl);
-                            bomCaptchaUrl = pickCaptchaSource(extractRedirectUrl(response.headers));
-                            bomFallbackUrl = BAIDU_SEARCH_URL + encodeURIComponent(keyword);
-                            showVerifyBanner();
+                            registerVerification('baidu', pickCaptchaSource(extractRedirectUrl(response.headers), url), url);
                         } else {
                             console.warn('[官网补全] 百度返回异常或过短', response.status, finalUrl);
                         }
@@ -504,11 +558,9 @@
         });
     }
 
-    // ==================== 百度验证被拦时的提示条 + 重试 ====================
-    let bomVerifying = false;
+    // ==================== 安全验证被拦时的提示条 + 重试（百度/360/搜狗/头条通用） ====================
     let bomLastRetryAt = 0;
-    let bomCaptchaUrl = '';
-    let bomFallbackUrl = '';
+    let bomPendingVerifications = []; // [{ engine, label, url }]
     const BOM_BANNER_STYLE = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);width:fit-content;min-width:min(420px,calc(100vw - 32px));' +
         'z-index:2147483000;max-width:calc(100vw - 32px);box-sizing:border-box;' +
         'display:flex;align-items:center;gap:8px;flex-wrap:wrap;' +
@@ -527,64 +579,104 @@
         return '';
     }
 
-    // 只优先使用"看起来像验证页"的地址（百度下发的真实挑战），否则回退到首页重新触发验证
-    function pickCaptchaSource(location) {
+    // 只优先使用"看起来像验证页"的地址（引擎下发的真实挑战），否则回退到引擎首页重新触发验证
+    function pickCaptchaSource(location, base) {
+        const raw = String(location || '');
+        if (!raw) return '';
         try {
-            const url = new URL(location);
-            if (/wappass|verify|captcha|qrcode|passport|security|tuxing/i.test(url.hostname + url.pathname)) return url.href;
+            const url = new URL(raw, base);
+            if (looksLikeChallenge(url.href)) return url.href;
         } catch (_) { /* 非 URL 则忽略 */ }
         return '';
     }
 
+    // 记录一个待处理的验证挑战：同一引擎只保留一条，多个引擎同时被拦则在同一提示条里并列
+    function registerVerification(engine, captchaUrl, fallbackUrl) {
+        const meta = ENGINE_VERIFY[engine] || { label: engine, home: '' };
+        const url = captchaUrl || fallbackUrl || meta.home;
+        const existing = bomPendingVerifications.find(item => item.engine === engine);
+        if (existing) {
+            if (url) existing.url = url;
+        } else {
+            bomPendingVerifications.push({ engine, label: meta.label, url, home: meta.home });
+        }
+        showVerifyBanner();
+    }
+
     function showVerifyBanner() {
-        if (bomVerifying && document.getElementById('bom-verify-banner')) return;
-        bomVerifying = true;
+        const pending = bomPendingVerifications;
+        if (!pending.length) return;
         const old = document.getElementById('bom-verify-banner');
         if (old) old.remove();
 
         const bar = document.createElement('div');
         bar.id = 'bom-verify-banner';
         bar.style.cssText = BOM_BANNER_STYLE;
+        const info = document.createElement('div');
+        info.style.cssText = 'display:flex;flex-direction:column;gap:2px;min-width:0;';
         const text = document.createElement('span');
-        text.textContent = '百度安全验证拦截，未能获取官网数据。请先完成验证后再重试。';
-        bar.appendChild(text);
+        text.textContent = `${pending.map(item => item.label).join('、')}安全验证拦截，未能获取完整参考数据。`;
+        info.appendChild(text);
+        const hint = document.createElement('span');
+        hint.style.cssText = 'font-size:12px;opacity:.85;';
+        hint.textContent = `若验证反复不通过（尤其 360），请点「打开${pending[0].label}首页」在新标签页里随便搜一次，再回来点「重试」。`;
+        info.appendChild(hint);
+        bar.appendChild(info);
 
         const goBtn = document.createElement('button');
         goBtn.type = 'button';
-        goBtn.textContent = '去完成百度验证';
+        goBtn.textContent = `去完成${pending[0].label}验证`;
         goBtn.style.cssText = 'border:1px solid #c2981f;border-radius:4px;background:#fff;padding:3px 10px;cursor:pointer;font:inherit;';
-        goBtn.onclick = () => {
-            const url = bomCaptchaUrl || bomFallbackUrl || 'https://www.baidu.com';
-            // 优先开真正的独立弹窗（带尺寸串，才能用 win.closed 感知关闭并做"过码后回调"）
-            let win = null;
-            try {
-                win = window.open(url, 'bomVerify', 'popup=1,width=900,height=660,left=120,top=80,resizable=yes,scrollbars=yes,status=yes');
-            } catch (_) { /* ignore */ }
-            if (win) {
-                watchPopupClose(win);
-                return;
-            }
-            // 弹窗被拦，回退为新标签页（仍是 window.open，仅目标不同）
-            win = window.open(url, '_blank');
-            if (!win) {
-                goBtn.textContent = '弹出窗口被拦截，请在本站放行弹窗后重试';
-                goBtn.style.borderColor = '#b91c1c';
-                console.warn('[官网补全] 浏览器拦截了弹窗，请在站点设置允许 bing.com 弹窗后再次点击');
-                return;
-            }
-            watchPopupClose(win);
-        };
+        goBtn.onclick = () => openVerifyPopup(pending[0].url, goBtn);
         bar.appendChild(goBtn);
+
+        // 新标签页打开引擎首页：不监听关闭（用户要在里面正常搜索养会话），因而不参与自动重试
+        const homeBtn = document.createElement('button');
+        homeBtn.type = 'button';
+        homeBtn.textContent = `打开${pending[0].label}首页`;
+        homeBtn.title = '在新标签页打开，并在里面随便搜一次';
+        homeBtn.style.cssText = 'border:1px solid #c2981f;border-radius:4px;background:#fff;padding:3px 10px;cursor:pointer;font:inherit;';
+        homeBtn.onclick = () => openEngineHomeInNewTab(pending[0].home);
+        bar.appendChild(homeBtn);
 
         const retryBtn = document.createElement('button');
         retryBtn.type = 'button';
         retryBtn.id = 'bom-verify-retry';
         retryBtn.textContent = '重试';
         retryBtn.style.cssText = 'border:1px solid #c2981f;border-radius:4px;background:#fff;padding:3px 10px;cursor:pointer;font:inherit;';
-        retryBtn.onclick = () => triggerBaiduRetry();
+        retryBtn.onclick = () => triggerVerifyRetry();
         bar.appendChild(retryBtn);
 
         document.body.appendChild(bar);
+    }
+
+    // 普通新标签页打开（不是被 watchPopupClose 跟踪的弹窗），用于让用户在新页面里"养"出正常会话
+    function openEngineHomeInNewTab(url) {
+        if (!url) return;
+        const win = window.open(url, '_blank');
+        if (!win) {
+            console.warn('[官网补全] 浏览器拦截了新标签页，请在站点设置允许 bing.com 弹窗后再次点击');
+        }
+    }
+
+    function openVerifyPopup(url, btn) {
+        const target = url || 'https://www.baidu.com';
+        // 优先开真正的独立弹窗（带尺寸串，才能用 win.closed 感知关闭并做"过码后回调"）
+        let win = null;
+        try {
+            win = window.open(target, 'bomVerify', 'popup=1,width=900,height=660,left=120,top=80,resizable=yes,scrollbars=yes,status=yes');
+        } catch (_) { /* ignore */ }
+        if (!win) {
+            // 弹窗被拦，回退为新标签页（仍是 window.open，仅目标不同）
+            win = window.open(target, '_blank');
+        }
+        if (!win) {
+            btn.textContent = '弹出窗口被拦截，请在本站放行弹窗后重试';
+            btn.style.borderColor = '#b91c1c';
+            console.warn('[官网补全] 浏览器拦截了弹窗，请在站点设置允许 bing.com 弹窗后再次点击');
+            return;
+        }
+        watchPopupClose(win);
     }
 
     function watchPopupClose(win) {
@@ -592,20 +684,20 @@
             if (win.closed) {
                 clearInterval(timer);
                 console.log('[官网补全] 验证窗口已关闭，自动重试抓取');
-                triggerBaiduRetry();
+                triggerVerifyRetry();
             }
         }, 500);
         // 兜底：超过 10 分钟未关闭就不再轮询，避免泄漏
         setTimeout(() => clearInterval(timer), 10 * 60 * 1000);
     }
 
-    function triggerBaiduRetry() {
+    function triggerVerifyRetry() {
         const now = Date.now();
         if (now - bomLastRetryAt < 3000) return; // 防抖，防止连续点击造成连环请求
         bomLastRetryAt = now;
         const bar = document.getElementById('bom-verify-banner');
         if (bar) bar.remove();
-        bomVerifying = false;
+        bomPendingVerifications = [];
         // 清理上一次结果后重新抓取并标记（与 runScript 的清理保持一致）
         document.querySelectorAll('[data-bom-tag="true"]').forEach(el => el.remove());
         document.querySelectorAll('li[data-bom-injected="true"]').forEach(el => el.remove());
@@ -867,7 +959,7 @@
     }
 
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision, defaultConfig, normalizeConfig, aiProviderPresets, exclusionPresetWords, shouldExcludeKeyword, summarizeEngineEvidence, extractModelIds, hasDownloadIntent, isDownloadUrl, shouldConfirmNavigation, stripDownloadKeywords };
+        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision, defaultConfig, normalizeConfig, aiProviderPresets, exclusionPresetWords, shouldExcludeKeyword, summarizeEngineEvidence, extractModelIds, hasDownloadIntent, isDownloadUrl, shouldConfirmNavigation, stripDownloadKeywords, looksLikeChallenge, pickCaptchaSource, isVerificationResponse };
         return;
     }
 
