@@ -49,9 +49,6 @@
         'bit.ly', 't.co', 'tinyurl.com', 'goo.gl', 'is.gd', 'ow.ly', 'rb.gy'
     ]);
 
-    // XSN（星海安全网络）接入：只用其官网首页「API 接入」里公开列出的查询接口
-    //   GET /v1/ioc/:type/:value   单条情报快速查询
-    // 脚本只读：不注册节点、不上报、不调用任何写入接口
     const XSN_DEFAULT_ENDPOINT = 'https://xsn.linubuntu.dpdns.org';
     const XSN_IOC_KEY = 'bom-xsn-ioc-cache';
     const XSN_IOC_TTL_MS = 10 * 60 * 1000;
@@ -96,8 +93,6 @@
 
     // 走移动端入口的引擎：结果页是服务端直出、不依赖会话，也不需要带 cookie。
     // 带上 PC 端 cookie 反而可能把"验证中"的状态带过去，所以这类引擎一律匿名请求。
-    // 360 桌面端 www.so.com/s 直接被 qcaptcha 挡住（实测必跳验证页），
-    // 移动端 m.so.com/s 同关键词正常返回结果，因此 360 改用移动入口。
     const ENGINE_ANONYMOUS_ONLY = new Set(['so360']);
 
     function usesEngineCookies(hostname) {
@@ -166,8 +161,6 @@
                 ...base.engines,
                 ...(value.engines || {}),
                 quark: false, // 神马/夸克：验证模块无法脚本化，永久关闭
-                // 版本号落后就一次性回落到新的默认值（360/搜狗 默认关）；
-                // 已经迁移过的话，用户手动开启的选择不再被覆盖
                 ...(Number(value.engineDefaultsVersion || 0) < ENGINE_DEFAULTS_VERSION
                     ? Object.fromEntries(ENGINE_DEFAULT_OFF.map(engine => [engine, false]))
                     : {})
@@ -444,7 +437,6 @@
         return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
 
-    // 下载意图词去除后得到的"参考词"，用于再次搜索定位官网（如 "qq 下载" → "qq"）
     function stripDownloadKeywords(keyword, config) {
         const words = Array.isArray(config?.downloadKeywords) ? config.downloadKeywords : DEFAULT_DOWNLOAD_KEYWORDS;
         let text = String(keyword || '').trim();
@@ -1138,7 +1130,6 @@
     // ==================== 改进的等待容器函数 ====================
     function waitForContainer(maxWaitMs = 30000) {
         return new Promise((resolve) => {
-            // 先立即检查
             const existing = getResultsContainer();
             if (existing) {
                 resolve(existing);
@@ -1148,7 +1139,6 @@
             let timeoutId = null;
             let intervalId = null;
 
-            // 定时轮询（兜底）
             intervalId = setInterval(() => {
                 const container = getResultsContainer();
                 if (container) {
@@ -1158,7 +1148,6 @@
                 }
             }, 300);
 
-            // MutationObserver 监听
             const observer = new MutationObserver(() => {
                 const container = getResultsContainer();
                 if (container) {
@@ -1173,7 +1162,6 @@
                 subtree: true
             });
 
-            // 超时
             timeoutId = setTimeout(() => {
                 observer.disconnect();
                 clearInterval(intervalId);
@@ -1390,7 +1378,6 @@
         lastSearchKey = searchKey;
         const searchId = ++activeSearchId;
 
-        // 清除之前可能残留的标记
         window._my_bing_injected = false;
 
         // 移除之前插入的官方标签（避免重复）
