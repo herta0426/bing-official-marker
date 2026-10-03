@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         BaiduDreamourBings
 // @namespace    https://github.com/herta0426/bing-official-marker
-// @version      1.4
+// @version      1.4.1
 // @description  必应结果官网标记/补全（百度等引擎交叉校验），零请求解析跳转壳，可选 XSN 情报标红与可信平台免检查，拦截可疑下载
 // @author       herta0426
 // @license      MIT
 // @homepageURL  https://github.com/herta0426/bing-official-marker
 // @supportURL   https://github.com/herta0426/bing-official-marker/issues
-// @downloadURL  https://raw.githubusercontent.com/herta0426/bing-official-marker/main/baidudreamourbings.user.js
-// @updateURL    https://raw.githubusercontent.com/herta0426/bing-official-marker/main/baidudreamourbings.user.js
+// 刻意不写 @downloadURL / @updateURL：脚本在多个平台分发，写死 GitHub raw 地址会把
+// 其它平台上的安装也拉向 GitHub，各平台版本容易打架。缺失时 Tampermonkey 会用
+// 安装来源 URL 作为更新源，各平台各自管理自己的更新。
 // @match        https://*.bing.com/search?*
 // @run-at       document-idle
 // @noframes

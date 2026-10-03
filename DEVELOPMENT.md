@@ -34,7 +34,7 @@ Bing 搜索页加载 / SPA 导航 / MutationObserver
 
 ## 元数据块（UserScript header）
 
-按 Tampermonkey 规范补全：`@namespace` 用仓库地址（原先是 TM 占位符 `http://tampermonkey.net/`）、`@license MIT`、`@homepageURL`/`@supportURL`、`@downloadURL`/`@updateURL` 指向 `main` 的 raw 地址（自动更新）、`@run-at document-idle`（与 TM 默认一致，显式写出）、`@noframes`。`@grant` 只列真正用到的 5 个 API：`GM_xmlhttpRequest`/`GM_addStyle`/`GM_getValue`/`GM_setValue`/`GM_registerMenuCommand`。
+按 Tampermonkey 规范补全：`@namespace` 用仓库地址（原先是 TM 占位符 `http://tampermonkey.net/`）、`@license MIT`、`@homepageURL`/`@supportURL`（**不写** `@downloadURL`/`@updateURL`：多平台分发时写死 GitHub raw 会把其它平台的安装也拉向 GitHub，缺失时 Tampermonkey 用安装来源 URL 作更新源）、`@run-at document-idle`（与 TM 默认一致，显式写出）、`@noframes`。`@grant` 只列真正用到的 5 个 API：`GM_xmlhttpRequest`/`GM_addStyle`/`GM_getValue`/`GM_setValue`/`GM_registerMenuCommand`。
 
 > **改 `@namespace` 的代价**：TM 以 `@namespace`+`@name` 识别脚本，改动后已装旧版的用户升级时可能被当成新脚本，**GM 存储里的配置（`bom-config`）会回到默认**，需要重新设置一次。发布后不要再改。
 

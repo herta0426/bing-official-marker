@@ -43,6 +43,8 @@
    - [安装脚本（GitHub）](https://raw.githubusercontent.com/herta0426/bing-official-marker/main/baidudreamourbings.user.js)
    - [安装脚本（jsDelivr）](https://cdn.jsdelivr.net/gh/herta0426/bing-official-marker@main/baidudreamourbings.user.js)
    - [安装脚本（Greasy Fork）](https://greasyfork.org/zh-CN/scripts/598249-baidudreamourbings)(不推荐，国内被拦截）
+
+   > 脚本不再写死更新地址：**从哪个平台安装，就由哪个平台负责更新**（Tampermonkey 缺失 `@updateURL` 时会用安装来源 URL 作为更新源）。想换源，换个地址重装一次即可。
 4. 首次使用会请求跨域授权（`www.baidu.com`、`wappass.baidu.com`、`www.sogou.com`、`m.so.com`、`qcaptcha.so.com`、`so.toutiao.com` 等），请点**允许**，否则对应引擎的请求会被拦截、脚本静默少拿到证据。启用 XSN 情报查询时会额外用到 `xsn.linubuntu.dpdns.org`。
 5. 访问 `https://cn.bing.com/search?q=强调`，约 1~3 秒完成标记/补充。
 
@@ -141,6 +143,10 @@ node --test tests/security-helpers.test.js              # 单元测试
 ---
 
 ## 更新日志
+
+### 1.4.1
+
+- **移除写死的 `@downloadURL` / `@updateURL`**：脚本在多个平台分发，硬编码 GitHub raw 地址会把其它平台上的安装也拉向 GitHub 版本，各平台版本容易打架。缺失这两个字段时，Tampermonkey 会用**安装来源 URL** 作为更新源——从哪个平台装的，就由哪个平台负责更新。已装旧版的用户更新到 1.4.1 后即生效。
 
 ### 1.4
 
