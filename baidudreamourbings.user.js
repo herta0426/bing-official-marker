@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BaiduDreamourBings
 // @namespace    https://github.com/herta0426/bing-official-marker
-// @version      1.1
-// @description  在必应搜索结果中标记/补全官网（百度等国内引擎交叉校验），并拦截可疑下载链接
+// @version      1.3
+// @description  必应结果官网标记/补全（百度等引擎交叉校验），零请求解析跳转壳，可选 XSN 情报标红与可信平台免检查，拦截可疑下载
 // @author       herta0426
 // @license      MIT
 // @homepageURL  https://github.com/herta0426/bing-official-marker
@@ -28,10 +28,11 @@
 // @connect      www.sogou.com
 // @connect      www.so.com
 // @connect      qcaptcha.so.com
-// @connect      www.so.toutiao.com
+// @connect      so.toutiao.com
 // @connect      www.sm.cn
 // @connect      m.sm.cn
 // @connect      quark.sm.cn
+// @connect      xsn.linubuntu.dpdns.org
 // ==/UserScript==
 
 (function() {
@@ -45,6 +46,26 @@
     const SHORTENER_HOSTS = new Set([
         'bit.ly', 't.co', 'tinyurl.com', 'goo.gl', 'is.gd', 'ow.ly', 'rb.gy'
     ]);
+
+    // XSN（星海安全网络）接入：只用其官网首页「API 接入」里公开列出的查询接口
+    //   GET /v1/ioc/:type/:value   单条情报快速查询
+    // 脚本只读：不注册节点、不上报、不调用任何写入接口
+    const XSN_DEFAULT_ENDPOINT = 'https://xsn.linubuntu.dpdns.org';
+    const XSN_IOC_KEY = 'bom-xsn-ioc-cache';
+    const XSN_IOC_TTL_MS = 10 * 60 * 1000;
+    const XSN_LOOKUP_MAX = 20;          // 单页最多查询的域名数
+    const XSN_HIGH_SEVERITIES = new Set(['critical', 'high']);
+
+    // 可信平台（免检查名单）：平台本身可信，但其页面内容由用户上传，
+    // 脚本只能判定"平台域名是不是这个平台"，没法判定仓库/帖子/评论里的内容安全。
+    // 命中后不再做未验证/需确认提醒，也不查 XSN；本地高危（HTTP、IP、短链等）仍照常标红。
+    const DEFAULT_TRUSTED_PLATFORMS = [
+        'github.com', 'gitlab.com', 'gitee.com', 'bitbucket.org',
+        'stackoverflow.com', 'stackexchange.com',
+        'wikipedia.org', 'wikimedia.org',
+        'zhihu.com', 'reddit.com', 'tieba.baidu.com', 'v2ex.com',
+        'bilibili.com', 'youtube.com'
+    ];
 
     const AI_PROVIDERS = {
         openai: { name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', apiKey: '' },
@@ -68,7 +89,7 @@
         baidu:   { label: '百度', host: 'baidu.com',      home: 'https://www.baidu.com/' },
         so360:   { label: '360',  host: 'so.com',         home: 'https://www.so.com/' },
         sogou:   { label: '搜狗', host: 'sogou.com',      home: 'https://www.sogou.com/' },
-        toutiao: { label: '头条', host: 'so.toutiao.com', home: 'https://www.so.toutiao.com/' }
+        toutiao: { label: '头条', host: 'so.toutiao.com', home: 'https://so.toutiao.com/' }
     };
 
     function usesEngineCookies(hostname) {
@@ -101,7 +122,9 @@
             alwaysBlockRisk: true,
             exclusions: { enabled: true, presets: { weather: true, news: true, lifestyle: true, entertainment: false, realtime: true }, words: [] },
             engines: { baidu: true, google: false, duckduckgo: false, sogou: true, so360: true, toutiao: true, quark: false },
-            ai: { enabled: false, provider: 'openai', baseUrl: AI_PROVIDERS.openai.baseUrl, model: AI_PROVIDERS.openai.model, apiKey: '' }
+            trustedPlatforms: [...DEFAULT_TRUSTED_PLATFORMS],
+            ai: { enabled: false, provider: 'openai', baseUrl: AI_PROVIDERS.openai.baseUrl, model: AI_PROVIDERS.openai.model, apiKey: '' },
+            xsn: { enabled: false }
         };
     }
 
@@ -116,7 +139,14 @@
             ...value,
             exclusions: { ...base.exclusions, ...(value.exclusions || {}), presets: { ...base.exclusions.presets, ...((value.exclusions || {}).presets || {}) }, words: Array.isArray((value.exclusions || {}).words) ? [...new Set(value.exclusions.words.filter(word => typeof word === 'string' && word.trim()))] : base.exclusions.words },
             engines: { ...base.engines, ...(value.engines || {}), quark: false },
-            ai: { ...base.ai, ...ai, provider, apiKey: typeof ai.apiKey === 'string' ? ai.apiKey : '' }
+            trustedPlatforms: Array.isArray(value.trustedPlatforms)
+                ? [...new Set(value.trustedPlatforms.filter(host => typeof host === 'string' && host.trim()).map(host => host.trim().toLowerCase()))]
+                : base.trustedPlatforms,
+            ai: { ...base.ai, ...ai, provider, apiKey: typeof ai.apiKey === 'string' ? ai.apiKey : '' },
+            xsn: {
+                // 接入 XSN 是用户选择：缺省即关
+                enabled: (value.xsn || {}).enabled === true
+            }
         };
     }
 
@@ -147,20 +177,42 @@
         return new Promise((resolve, reject) => GM_xmlhttpRequest({ method: 'GET', url: endpoint, anonymous: true, timeout: 15000, headers: { Authorization: 'Bearer ' + config.ai.apiKey }, onload: response => { try { if (response.status < 200 || response.status >= 300) throw new Error('HTTP ' + response.status); resolve(extractModelIds(JSON.parse(response.responseText))); } catch (error) { reject(error); } }, onerror: () => reject(new Error('模型列表请求失败')), ontimeout: () => reject(new Error('模型列表请求超时')) }));
     }
 
-    // 解析参考引擎的结果链接为真实目标域名：遇包壳跳转(如 360 的 /link?m=、搜狗 /link?url=)则跟随重定向取 finalUrl
-    function resolveRealHost(rawHref, baseUrl) {
-        let parsed = null;
-        try { parsed = new URL(rawHref, baseUrl); } catch (_) { return Promise.resolve(''); }
-        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return Promise.resolve('');
-        const wrapped = /(^|\.)(google\.com|duckduckgo\.com|sogou\.com|so\.com|so\.toutiao\.com|sm\.cn|baidu\.com)$/i.test(parsed.hostname);
-        if (!wrapped) return Promise.resolve(parsed.hostname); // 已是真实目标
-        if (parsed.protocol !== 'https:') return Promise.resolve(''); // 包壳站需 https，降级跳过
-        return new Promise(resolve => GM_xmlhttpRequest({
-            // 包壳跳转发生在国内引擎域上，同样携带 cookie，避免跳转也撞验证
-            method: 'GET', url: parsed.href, anonymous: !usesEngineCookies(parsed.hostname), timeout: 7000,
-            onload: r => { try { resolve(new URL(r.finalUrl || r.responseURL || parsed.href).hostname); } catch (_) { resolve(''); } },
-            onerror: () => resolve(''), ontimeout: () => resolve('')
-        }));
+    // 引擎主机：这些域上的链接是"壳"（跳转地址或加密 token），不是结果本身
+    const ENGINE_WRAPPER_SUFFIXES = ['google.com', 'duckduckgo.com', 'sogou.com', 'so.com', 'toutiao.com', 'sm.cn', 'baidu.com'];
+
+    function isEngineHost(hostname) {
+        const host = String(hostname || '').toLowerCase();
+        return ENGINE_WRAPPER_SUFFIXES.some(suffix => host === suffix || host.endsWith('.' + suffix));
+    }
+
+    function isSkippedHost(hostname) {
+        const host = String(hostname || '').toLowerCase();
+        return NON_EVIDENCE_HOSTS.some(item => host === item || host.endsWith('.' + item));
+    }
+
+    // 壳地址常把真实目标编码在参数上：头条 /search/jump?…&url=<编码的 zlink，内含再一层 h5_url>、
+    // Google /url?q=<目标>、DuckDuckGo /l/?uddg=<编码目标>。纯解码即可拿到目标主机名。
+    // 中间层可能仍是引擎自己的跳转壳，所以递归解（限 3 层）。搜狗的 url= 是加密串，
+    // 解不出合法 URL，会自然落到"放弃"，不会误当成证据。
+    function extractEmbeddedTarget(raw, base, depth) {
+        if (!raw || (depth || 0) > 3) return '';
+        let url = null;
+        try { url = new URL(raw, base); } catch (_) { return ''; }
+        for (const name of EMBEDDED_TARGET_PARAMS) {
+            const value = url.searchParams.get(name);
+            if (!value) continue;
+            let inner = null;
+            try { inner = new URL(value, base); } catch (_) { continue; }
+            if (inner.protocol !== 'http:' && inner.protocol !== 'https:') continue;
+            if (isSkippedHost(inner.hostname)) continue;
+            if (isEngineHost(inner.hostname)) {
+                const deeper = extractEmbeddedTarget(inner.href, base, (depth || 0) + 1);
+                if (deeper) return deeper;
+                continue;
+            }
+            return inner.hostname;
+        }
+        return '';
     }
 
     // 参考引擎响应是否被人机验证拦截：Location/finalUrl 落到挑战页，或小体积的验证页正文。
@@ -172,8 +224,62 @@
         return text.length < 20000 && /访问异常页面|安全验证|人机验证|滑动验证|拖动滑块|访问过于频繁|请输入.{0,8}验证码/i.test(text);
     }
 
+    // 各参考引擎的搜索地址。主机名必须同时出现在文件头的 @connect 里，否则 TM 会拒绝请求。
+    // 注意头条：老代码用的是 www.so.toutiao.com，该主机已不存在（DNS 解析失败），
+    // 会让头条参考静默拿不到数据，正确的主机是 so.toutiao.com。
+    function engineSearchUrls(keyword) {
+        const query = encodeURIComponent(keyword);
+        return {
+            google: `https://www.google.com/search?q=${query}`,
+            duckduckgo: `https://html.duckduckgo.com/html/?q=${query}`,
+            sogou: `https://www.sogou.com/web?query=${query}`,
+            so360: `https://www.so.com/s?q=${query}`,
+            toutiao: `https://so.toutiao.com/search?keyword=${query}`,
+            quark: `https://quark.sm.cn/s?q=${query}`
+        };
+    }
+
+    // 引擎结果页上的这些主机不参与证据抓取：它们是引擎自己的功能入口（AI 问答、风控反馈），
+    // 既不是"包壳跳转"，也不该写进 @connect（写了 TM 会真的去请求，白等 7 秒还污染证据集）
+    const NON_EVIDENCE_HOSTS = ['ai.so.com', 'fankui.sogou.com'];
+
+    // 有的引擎把真实目标地址直接挂在结果 <a> 的属性上（如 360 的 data-mdurl / e-landurl），
+    // 那就读属性即可：零网络请求，也就不存在 @connect 拦跳转的问题。
+    // 属性不存在时退回 href（先尝试解码壳里的明文目标）。
+    const REAL_TARGET_ATTRS = ['data-mdurl', 'e-landurl'];
+
+    // 壳地址里可能编码着明文目标的参数名（按优先级）
+    const EMBEDDED_TARGET_PARAMS = ['h5_url', 'uddg', 'q', 'url', 'target'];
+
+    // 结果项 → 真实目标主机名，全程零网络请求：
+    //   1) 目标挂在 <a> 属性上（360 的 data-mdurl / e-landurl）
+    //   2) 壳地址里编码了明文目标（解码，可递归）
+    //   3) 本来就是直链
+    // 都拿不到的（如搜狗 /link?url= 的加密串）直接放弃：不再跟跳转。
+    // 因为 TM 对跳转落点同样校验 @connect，跟也只会被拦（Request was redirected to a
+    // not whitelisted URL），白刷一屏红字且一条证据都拿不到。
+    function resolveAnchorHost(anchor, base) {
+        const attr = name => (anchor.getAttribute ? anchor.getAttribute(name) : null);
+        for (const name of REAL_TARGET_ATTRS) {
+            const raw = attr(name);
+            if (!raw) continue;
+            try {
+                const url = normalizeHttpUrl(new URL(raw, base).href);
+                if (url && !isEngineHost(url.hostname) && !isSkippedHost(url.hostname)) return url.hostname;
+            } catch (_) { /* 属性值不是合法地址就继续看下一个 */ }
+        }
+        const href = attr('href') || '';
+        const embedded = extractEmbeddedTarget(href, base, 0);
+        if (embedded) return embedded;
+        let parsed = null;
+        try { parsed = new URL(href, base); } catch (_) { return ''; }
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+        if (isEngineHost(parsed.hostname) || isSkippedHost(parsed.hostname)) return ''; // 已知壳：放弃，不发注定被拦的请求
+        return parsed.hostname;
+    }
+
     function fetchEngineDomains(keyword, engine) {
-        const urls = { google: `https://www.google.com/search?q=${encodeURIComponent(keyword)}`, duckduckgo: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(keyword)}`, sogou: `https://www.sogou.com/web?query=${encodeURIComponent(keyword)}`, so360: `https://www.so.com/s?q=${encodeURIComponent(keyword)}`, toutiao: `https://www.so.toutiao.com/search?keyword=${encodeURIComponent(keyword)}`, quark: `https://quark.sm.cn/s?q=${encodeURIComponent(keyword)}` };
+        const urls = engineSearchUrls(keyword);
         const base = urls[engine];
         if (!base) return Promise.resolve(new Set());
         const managed = Boolean(ENGINE_VERIFY[engine]); // 国内引擎：携带 cookie + 验证兜底
@@ -195,21 +301,30 @@
                     return resolve(hosts);
                 }
                 const doc = new DOMParser().parseFromString(response.responseText, 'text/html');
-                const anchors = [...doc.querySelectorAll('a[href]')];
+                // 属性里带真实目标的引擎（360）不一定有 href，选择器要把这两种也算进来
+                const anchors = [...doc.querySelectorAll('a[href], a[data-mdurl], a[e-landurl]')];
                 let iter = 0;
                 for (const anchor of anchors) {
-                    if (iter++ >= 25 || hosts.size >= 15) break; // 限制跟随量与结果数，避免请求过多
-                    const host = await resolveRealHost(anchor.getAttribute('href') || '', base);
+                    if (iter++ >= 25 || hosts.size >= 15) break; // 限制解析量与结果数
+                    const host = resolveAnchorHost(anchor, base);
                     if (host) hosts.add(host);
                 }
                 resolve(hosts);
             },
             onerror: err => {
-                // 跳转落到 @connect 未覆盖的域名时 TM 会直接报错，这里至少留下可诊断的日志
-                if (managed) console.warn('[官网补全] ' + ENGINE_VERIFY[engine].label + ' 请求被中断（可能是验证跳转到了未授权域名）:', err && err.error);
+                // 三种都会走到这里：域名失效/DNS 失败、网络中断、跳转落到 @connect 未覆盖的域名。
+                // err.error 只在 @connect 被拒时有值，所以以前把域名失效也报成"验证跳转"，容易误判。
+                if (managed) {
+                    const detail = (err && (err.error || err.statusText))
+                        || (err && err.status ? 'HTTP ' + err.status : '连接失败（域名可能已失效，或被网络/@connect 拦截）');
+                    console.warn('[官网补全] ' + ENGINE_VERIFY[engine].label + ' 请求失败：', detail, '|', base);
+                }
                 resolve(new Set());
             },
-            ontimeout: () => resolve(new Set())
+            ontimeout: () => {
+                if (managed) console.warn('[官网补全] ' + ENGINE_VERIFY[engine].label + ' 请求超时：', base);
+                resolve(new Set());
+            }
         }));
     }
 
@@ -292,7 +407,9 @@
           <p class="bom-note">百度认证、多引擎和 AI 都只是参考信号，最终拦截规则始终由本地安全规则决定。</p>
           <section><details class="bom-collapse" open><summary><h2>搜索行为</h2></summary><label><input type="checkbox" data-bom-enabled> 启用官网标记</label><label>保护模式 <select data-bom-mode><option value="download">下载保护（推荐）</option><option value="strict">严格保护</option><option value="mark">仅标记</option></select></label><label><input type="checkbox" data-bom-risk> 高风险链接始终拦截</label><label class="bom-inline">缓存时间 <input type="number" min="0" max="1440" data-bom-cache> 分钟</label><label>下载意图关键词（每行一个）<textarea rows="4" data-bom-download-words></textarea></label><label>下载扩展名（每行一个）<textarea rows="2" data-bom-download-exts></textarea></label></details></section>
           <section><details class="bom-collapse" open><summary><h2>排除词</h2></summary><p class="bom-note">命中排除词时不请求百度、不调用 AI，也不修改 Bing 结果。</p><div class="bom-presets"><label><input type="checkbox" data-bom-preset="weather"> 天气</label><label><input type="checkbox" data-bom-preset="news"> 新闻</label><label><input type="checkbox" data-bom-preset="lifestyle"> 生活</label><label><input type="checkbox" data-bom-preset="entertainment"> 娱乐</label><label><input type="checkbox" data-bom-preset="realtime"> 实时信息</label></div><label>自定义排除词（每行一个）<textarea rows="4" data-bom-words></textarea></label></details></section>
+          <section><details class="bom-collapse"><summary><h2>可信平台（免检查名单）</h2></summary><p class="bom-note">命中名单的结果不再显示「未验证」/「需确认」，也不查询 XSN，改标绿色「可信平台」。这些平台本身可信，但页面内容由用户上传（仓库、帖子、评论、视频等），<strong>脚本只判定平台域名本身，不分析内容安全性</strong>，需要你自己判断。本地高危（HTTP、IP、短链、非标准端口等）仍然照常标红，不受名单豁免。</p><label>平台域名（每行一个，含子域）<textarea rows="4" data-bom-trusted></textarea></label></details></section>
           <section><details class="bom-collapse" open><summary><h2>多引擎参考</h2></summary><div class="bom-presets"><label><input type="checkbox" data-bom-engine="baidu"> 百度认证</label><label><input type="checkbox" data-bom-engine="google"> Google</label><label><input type="checkbox" data-bom-engine="duckduckgo"> DuckDuckGo</label><label><input type="checkbox" data-bom-engine="sogou"> 搜狗</label><label><input type="checkbox" data-bom-engine="so360"> 360 搜索</label><label><input type="checkbox" data-bom-engine="toutiao"> 头条搜索</label><label><input type="checkbox" data-bom-engine="quark" disabled title="验证问题暂无法适配"> 神马搜索<span style="opacity:.6">（验证问题暂无法适配）</span></label></div><p class="bom-note">国内引擎（百度/360/搜狗/头条）抓取时携带浏览器既有 cookie；若被安全验证拦截，页面顶部会出现提示条，过码关窗后自动重试。神马/夸克因验证模块适配问题已禁用。</p></details></section>
+          <section><details class="bom-collapse"><summary><h2>XSN 情报</h2></summary><label><input type="checkbox" data-bom-xsn-enabled> 启用 XSN 情报查询</label><p class="bom-note">启用后按域名查询 XSN 情报，命中 <code>critical</code>/<code>high</code> 的结果标红为「XSN 风险」，悬停显示家族、等级、置信度与全网命中次数。本地规则只覆盖明文类特征（HTTP、IP、短链、非标准端口），像 HTTPS + 正常端口 + 真域名的站点本地只能给出「未验证」，这部分由 XSN 情报补上。</p></details></section>
           <section><details class="bom-collapse"><summary><h2>AI 辅助比对</h2></summary><label><input type="checkbox" data-bom-ai-enabled> 启用 AI 辅助分析</label><label>服务商 <select data-bom-ai-provider><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="qwen">通义千问</option><option value="custom">自定义 OpenAI 兼容接口</option></select></label><label>接口地址 <input type="url" data-bom-ai-url placeholder="https://api.example.com/v1"></label><label>API Key <input type="password" data-bom-ai-key autocomplete="off" placeholder="只保存在浏览器扩展存储"></label><label>模型 <select data-bom-ai-model-select data-bom-model-select><option value="custom">自定义</option></select></label><button type="button" data-bom-fetch-models>获取模型列表</button><label data-bom-custom-model hidden>自定义模型 <input type="text" data-bom-ai-model-custom placeholder="输入模型名称"></label><p class="bom-model-status" data-bom-model-status></p><p class="bom-note">只发送搜索词、标题、域名和 URL，不发送网页正文。AI 不能解除本地高风险拦截。</p></details></section>
           <div class="bom-actions"><button type="button" data-bom-reset>恢复默认</button><button type="button" data-bom-cancel>取消</button><button type="button" data-bom-save>保存配置</button></div><div class="bom-status" role="status" data-bom-status></div>
         </div>`;
@@ -312,6 +429,7 @@
             $('[data-bom-download-words]').value = (current.downloadKeywords || DEFAULT_DOWNLOAD_KEYWORDS).join('\n');
             $('[data-bom-download-exts]').value = (current.downloadExtensions || DEFAULT_DOWNLOAD_EXTENSIONS).join('\n');
             $('[data-bom-words]').value = current.exclusions.words.join('\n');
+            $('[data-bom-trusted]').value = (current.trustedPlatforms || DEFAULT_TRUSTED_PLATFORMS).join('\n');
             overlay.querySelectorAll('[data-bom-preset]').forEach(el => el.checked = current.exclusions.presets[el.dataset.bomPreset] !== false);
             overlay.querySelectorAll('[data-bom-engine]').forEach(el => el.checked = current.engines[el.dataset.bomEngine] === true);
             $('[data-bom-ai-enabled]').checked = current.ai.enabled;
@@ -321,6 +439,7 @@
             $('[data-bom-ai-model-custom]').value = current.ai.model;
             $('[data-bom-custom-model]').hidden = true;
             $('[data-bom-ai-key]').value = current.ai.apiKey;
+            $('[data-bom-xsn-enabled]').checked = current.xsn.enabled === true;
         };
         fill(config);
         const close = () => { document.body.style.overflow = ''; overlay.remove(); };
@@ -337,8 +456,10 @@
                 downloadKeywords: $('[data-bom-download-words]').value.split(/\r?\n|[,，]/).map(word => word.trim()).filter(Boolean),
                 downloadExtensions: $('[data-bom-download-exts]').value.split(/\r?\n|[,，]/).map(word => word.trim()).filter(Boolean),
                 exclusions: { enabled: true, presets: Object.fromEntries([...overlay.querySelectorAll('[data-bom-preset]')].map(el => [el.dataset.bomPreset, el.checked])), words: $('[data-bom-words]').value.split(/\r?\n|[,，]/).map(word => word.trim()).filter(Boolean) },
+                trustedPlatforms: $('[data-bom-trusted]').value.split(/\r?\n|[,，]/).map(host => host.trim()).filter(Boolean),
                 engines: Object.fromEntries([...overlay.querySelectorAll('[data-bom-engine]')].map(el => [el.dataset.bomEngine, el.checked])),
-                ai: { enabled: $('[data-bom-ai-enabled]').checked, provider: $('[data-bom-ai-provider]').value, baseUrl: $('[data-bom-ai-url]').value.trim(), model: $('[data-bom-ai-model-select]').value === 'custom' ? $('[data-bom-ai-model-custom]').value.trim() : $('[data-bom-ai-model-select]').value, apiKey: $('[data-bom-ai-key]').value }
+                ai: { enabled: $('[data-bom-ai-enabled]').checked, provider: $('[data-bom-ai-provider]').value, baseUrl: $('[data-bom-ai-url]').value.trim(), model: $('[data-bom-ai-model-select]').value === 'custom' ? $('[data-bom-ai-model-custom]').value.trim() : $('[data-bom-ai-model-select]').value, apiKey: $('[data-bom-ai-key]').value },
+                xsn: { enabled: $('[data-bom-xsn-enabled]').checked }
             });
             saveConfig(next); $('[data-bom-status]').textContent = '已保存。刷新搜索页后生效。';
         });
@@ -410,6 +531,156 @@
         }
         return { ...urlDecision, label: '未验证', requiresConfirmation: true };
     }
+
+    // ==================== XSN 情报标红（只读） ====================
+    // 只用到 XSN（星海安全网络）官网首页「API 接入」公开列出的查询接口：
+    //   GET /v1/ioc/:type/:value   单条情报快速查询
+    // 脚本对 XSN 只读：不注册节点、不上报、不调用任何写入接口。
+    // 标签直接反映 XSN 的判定结果，不额外做本地语义推断：命中 high/critical → 「XSN 风险」。
+    // 它补的是本地看不到的那一类：HTTPS + 正常端口 + 真域名的站点，本地只能给出「未验证」。
+
+    function xsnIocIndex(list) {
+        const index = new Map();
+        (Array.isArray(list) ? list : []).forEach(item => {
+            const value = String((item && item.indicator_value) || '').toLowerCase();
+            if (!value || item.found === false) return;
+            index.set(value, {
+                severity: String(item.severity || '').toLowerCase(),
+                family: item.family || '',
+                confidence: item.confidence,
+                hit_count: item.hit_count,
+                status: String(item.status || '').toLowerCase()
+            });
+        });
+        return index;
+    }
+
+    function trustedPlatformList(config) {
+        const list = config && Array.isArray(config.trustedPlatforms) ? config.trustedPlatforms : DEFAULT_TRUSTED_PLATFORMS;
+        return list.map(host => String(host || '').trim().toLowerCase()).filter(Boolean);
+    }
+
+    // 只按主机名匹配平台本身：github.com 及其子域命中，github.com.evil.tld 不命中
+    function trustedPlatformFor(hostname, config) {
+        const host = String(hostname || '').toLowerCase();
+        if (!host) return null;
+        return trustedPlatformList(config).find(item => host === item || host.endsWith('.' + item)) || null;
+    }
+
+    // 免检查名单只压掉"未验证/需确认/XSN 情报"这类提醒，压不掉本地高危
+    function applyTrustedPlatformVerdict(decision, platform) {
+        if (!decision || !platform) return decision;
+        if (decision.level === 'high-risk') return decision;
+        if (decision.label === '官网参考') return decision;
+        return {
+            ...decision,
+            label: '可信平台',
+            requiresConfirmation: false,
+            trustedPlatform: platform,
+            reasons: [`${platform} 在可信平台名单里：脚本只判定平台域名本身`]
+        };
+    }
+
+    function xsnLookupHit(hostname, index) {
+        const host = String(hostname || '').toLowerCase();
+        if (!host || !(index instanceof Map)) return null;
+        if (index.has(host)) return index.get(host);
+        const domain = getRegistrableDomain(host);
+        return index.has(domain) ? index.get(domain) : null;
+    }
+
+    function xsnIsHigh(hit) {
+        return Boolean(hit) && XSN_HIGH_SEVERITIES.has(hit.severity) && hit.status !== 'false_positive';
+    }
+
+    function xsnHitTitle(hit) {
+        const parts = [`XSN 情报：${hit.family || '未标注家族'}`, `等级 ${hit.severity || '未知'}`];
+        if (hit.confidence != null) parts.push(`置信 ${hit.confidence}`);
+        if (hit.hit_count != null) parts.push(`全网命中 ${hit.hit_count} 次`);
+        if (hit.status) parts.push(`状态 ${hit.status}`);
+        return parts.join(' · ');
+    }
+
+    function applyXsnVerdict(decision, hit) {
+        // 免检查名单优先：名单内的平台不查情报，即使拿到命中也不覆盖「可信平台」
+        if (decision && decision.label === '可信平台') return decision;
+        if (!xsnIsHigh(hit)) return decision;
+        return {
+            ...decision,
+            label: 'XSN 风险',
+            requiresConfirmation: true,
+            xsn: hit,
+            reasons: [...new Set([...(decision.reasons || []), `XSN 情报：${hit.family || '未标注家族'}（${hit.severity}）`])]
+        };
+    }
+
+    // 刻意只实现 GET：脚本对 XSN 只有查询能力，结构上不存在写入路径
+    function xsnRequest(path, timeout) {
+        if (typeof GM_xmlhttpRequest !== 'function') return Promise.resolve(null);
+        return new Promise(resolve => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: XSN_DEFAULT_ENDPOINT + path,
+                anonymous: true,
+                timeout: timeout || 10000,
+                onload: response => {
+                    try {
+                        resolve({ status: response.status, data: JSON.parse(response.responseText) });
+                    } catch (_) {
+                        resolve({ status: response.status, data: null });
+                    }
+                },
+                onerror: () => resolve(null),
+                ontimeout: () => resolve(null)
+            });
+        });
+    }
+
+    // 按域逐个查公开情报；未命中的负结果一起缓存，10 分钟内不重复请求
+    async function xsnLookupHosts(hosts) {
+        const index = new Map();
+        const cachedHosts = new Set();
+        try {
+            const saved = JSON.parse(GM_getValue(XSN_IOC_KEY, 'null'));
+            const fresh = saved && Array.isArray(saved.entries) && Date.now() - Number(saved.at || 0) < XSN_IOC_TTL_MS;
+            (fresh ? saved.entries : []).forEach(entry => {
+                if (Array.isArray(entry) && entry.length === 2) {
+                    index.set(entry[0], entry[1]);
+                    cachedHosts.add(entry[0]);
+                }
+            });
+        } catch (_) { /* 缓存读取失败就当作空缓存 */ }
+        const targets = [...new Set(hosts.map(host => String(host || '').toLowerCase()).filter(Boolean))];
+        const missing = targets
+            .filter(host => !index.has(host) && !index.has(getRegistrableDomain(host)))
+            .slice(0, XSN_LOOKUP_MAX);
+        // 只有确实拿到 200 的查询才写缓存：限流/网络故障时不能把"查不到"当成"没问题"缓存下来
+        const resolved = new Set();
+        for (const host of missing) {
+            const response = await xsnRequest('/v1/ioc/domain/' + encodeURIComponent(host));
+            if (!response || response.status !== 200) continue;
+            const data = response.data;
+            resolved.add(host);
+            index.set(host, data && data.found ? {
+                severity: String(data.severity || '').toLowerCase(),
+                family: data.family || '',
+                confidence: data.confidence,
+                hit_count: data.hit_count,
+                status: String(data.status || '').toLowerCase()
+            } : null);
+        }
+        if (missing.length && !resolved.size) {
+            console.warn('[官网补全] XSN 情报查询未成功（可能是限流或网络问题），本次不做情报标记');
+        }
+        if (resolved.size) {
+            try {
+                const keep = [...index].filter(([host]) => cachedHosts.has(host) || resolved.has(host));
+                GM_setValue(XSN_IOC_KEY, JSON.stringify({ at: Date.now(), entries: keep.slice(-400) }));
+            } catch (_) { /* 存储不可用时只是不缓存，不影响标记 */ }
+        }
+        return index;
+    }
+
     const BAIDU_SEARCH_URL = 'https://www.baidu.com/s?wd=';
     const CACHE_PREFIX = 'bom:baidu:';
     const CACHE_TTL_MS = 10 * 60 * 1000;
@@ -862,6 +1133,15 @@
         const bingItems = container.querySelectorAll(SELECTOR_BING_ITEM);
         const matchedSet = new Set();
 
+        // 先批量取回本页结果域名的 XSN 公开情报（缓存 10 分钟），再统一做标记。
+        // 免检查名单里的域名不查 XSN：既不检查，也不把这些域名发出去
+        const resultHosts = [...bingItems]
+            .map(item => { const link = getResultLink(item); const parsed = link && normalizeHttpUrl(link.href); return parsed ? parsed.hostname : ''; })
+            .filter(Boolean);
+        const xsnHosts = resultHosts.filter(host => !trustedPlatformFor(host, config));
+        const xsnIndex = config.xsn.enabled && xsnHosts.length ? await xsnLookupHosts(xsnHosts) : new Map();
+        if (searchId !== activeSearchId) return;
+
         bingItems.forEach((item) => {
             const link = getResultLink(item);
             if (!link) return;
@@ -875,25 +1155,36 @@
                     break;
                 }
             }
+            const parsedLink = normalizeHttpUrl(link.href);
+            const xsnHit = config.xsn.enabled && parsedLink ? xsnLookupHit(parsedLink.hostname, xsnIndex) : null;
+            const trustedPlatform = parsedLink ? trustedPlatformFor(parsedLink.hostname, config) : null;
             const titleContainer = item.querySelector('h2, .b_title, .b_algoheader');
             if (titleContainer) {
                 const oldTags = titleContainer.querySelectorAll('span[data-bom-tag="true"]');
                 oldTags.forEach(el => el.remove());
 
-                const decision = getResultDecision(link.href, matched, matchType);
+                let decision = getResultDecision(link.href, matched, matchType);
+                decision = applyTrustedPlatformVerdict(decision, trustedPlatform);
+                decision = applyXsnVerdict(decision, xsnHit);
                 const title = decision.label === '未验证'
                     ? '未找到对应的百度认证官网，请在打开前核对域名'
+                    : decision.label === '可信平台' ? `${decision.trustedPlatform}：只判定平台域名本身，页面内容由用户上传（仓库/帖子/评论等），安全性请自行判断`
+                    : decision.label === 'XSN 风险' ? xsnHitTitle(decision.xsn)
                     : decision.label === '高风险链接' ? decision.reasons.join('、')
                     : decision.label === '官网参考' ? 'HTTPS 主机名与百度认证结果一致，但不代表页面绝对安全'
                     : '主域相同但主机名不同（认证: ' + matched.displayDomain + '）';
-                const extraStyle = decision.label === '高风险链接' ? { backgroundColor: '#b91c1c' }
+                const extraStyle = decision.label === '可信平台' ? { backgroundColor: '#15803d' }
+                    : decision.label === 'XSN 风险' ? { backgroundColor: '#b91c1c' }
+                    : decision.label === '高风险链接' ? { backgroundColor: '#b91c1c' }
                     : decision.label === '需确认' ? { backgroundColor: '#FF8C00' }
                     : decision.label === '未验证' ? { backgroundColor: '#6b7280' } : {};
                 const evidence = summarizeEngineEvidence(link.href, engineEvidence);
                 const evidenceTitle = evidence.matches > 1 ? `${title}；${evidence.label}（${evidence.matches} 个引擎）` : title;
                 titleContainer.appendChild(createTag(decision.label, evidenceTitle, extraStyle));
             }
-            const decision = getResultDecision(link.href, matched, matchType);
+            let decision = getResultDecision(link.href, matched, matchType);
+            decision = applyTrustedPlatformVerdict(decision, trustedPlatform);
+            decision = applyXsnVerdict(decision, xsnHit);
             decision.requiresConfirmation = shouldConfirmNavigation(link.href, matched, matchType, keyword, config);
             installNavigationGuard(link, decision, matched && matched.url);
             item.querySelectorAll('a[href]').forEach((anchor) => {
@@ -966,7 +1257,7 @@
     }
 
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision, defaultConfig, normalizeConfig, aiProviderPresets, exclusionPresetWords, shouldExcludeKeyword, summarizeEngineEvidence, extractModelIds, hasDownloadIntent, isDownloadUrl, shouldConfirmNavigation, stripDownloadKeywords, looksLikeChallenge, pickCaptchaSource, isVerificationResponse };
+        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision, defaultConfig, normalizeConfig, aiProviderPresets, exclusionPresetWords, shouldExcludeKeyword, summarizeEngineEvidence, extractModelIds, hasDownloadIntent, isDownloadUrl, shouldConfirmNavigation, stripDownloadKeywords, looksLikeChallenge, pickCaptchaSource, isVerificationResponse, trustedPlatformFor, applyTrustedPlatformVerdict, xsnIocIndex, xsnLookupHit, xsnIsHigh, xsnHitTitle, applyXsnVerdict, xsnLookupHosts, engineSearchUrls, isEngineHost, extractEmbeddedTarget, resolveAnchorHost, NON_EVIDENCE_HOSTS, REAL_TARGET_ATTRS, EMBEDDED_TARGET_PARAMS, fetchEngineDomains };
         return;
     }
 
