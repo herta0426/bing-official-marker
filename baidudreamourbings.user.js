@@ -7,9 +7,6 @@
 // @license      MIT
 // @homepageURL  https://github.com/herta0426/bing-official-marker
 // @supportURL   https://github.com/herta0426/bing-official-marker/issues
-// 刻意不写 @downloadURL / @updateURL：脚本在多个平台分发，写死 GitHub raw 地址会把
-// 其它平台上的安装也拉向 GitHub，各平台版本容易打架。缺失时 Tampermonkey 会用
-// 安装来源 URL 作为更新源，各平台各自管理自己的更新。
 // @match        https://*.bing.com/search?*
 // @run-at       document-idle
 // @noframes
