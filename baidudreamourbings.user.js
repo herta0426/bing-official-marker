@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BaiduDreamourBings
 // @namespace    https://github.com/herta0426/bing-official-marker
-// @version      1.3
+// @version      1.4
 // @description  必应结果官网标记/补全（百度等引擎交叉校验），零请求解析跳转壳，可选 XSN 情报标红与可信平台免检查，拦截可疑下载
 // @author       herta0426
 // @license      MIT
@@ -27,6 +27,7 @@
 // @connect      html.duckduckgo.com
 // @connect      www.sogou.com
 // @connect      www.so.com
+// @connect      m.so.com
 // @connect      qcaptcha.so.com
 // @connect      so.toutiao.com
 // @connect      www.sm.cn
@@ -87,10 +88,16 @@
     // 只有带 cookie 的请求才能在用户过码后复用验证结果，匿名请求过码无效。
     const ENGINE_VERIFY = {
         baidu:   { label: '百度', host: 'baidu.com',      home: 'https://www.baidu.com/' },
-        so360:   { label: '360',  host: 'so.com',         home: 'https://www.so.com/' },
+        so360:   { label: '360',  host: 'so.com',         home: 'https://m.so.com/' },
         sogou:   { label: '搜狗', host: 'sogou.com',      home: 'https://www.sogou.com/' },
         toutiao: { label: '头条', host: 'so.toutiao.com', home: 'https://so.toutiao.com/' }
     };
+
+    // 走移动端入口的引擎：结果页是服务端直出、不依赖会话，也不需要带 cookie。
+    // 带上 PC 端 cookie 反而可能把"验证中"的状态带过去，所以这类引擎一律匿名请求。
+    // 360 桌面端 www.so.com/s 直接被 qcaptcha 挡住（实测必跳验证页），
+    // 移动端 m.so.com/s 同关键词正常返回结果，因此 360 改用移动入口。
+    const ENGINE_ANONYMOUS_ONLY = new Set(['so360']);
 
     function usesEngineCookies(hostname) {
         const host = String(hostname || '').toLowerCase();
@@ -112,6 +119,8 @@
     function defaultConfig() {
         return {
             version: 2,
+            // 新配置自带最新版本号，不会被"回落默认关闭的引擎"的迁移逻辑再动一次
+            engineDefaultsVersion: ENGINE_DEFAULTS_VERSION,
             enabled: true,
             unknownConfirmation: true,
             riskBlocking: true,
@@ -121,12 +130,26 @@
             downloadExtensions: [...DEFAULT_DOWNLOAD_EXTENSIONS],
             alwaysBlockRisk: true,
             exclusions: { enabled: true, presets: { weather: true, news: true, lifestyle: true, entertainment: false, realtime: true }, words: [] },
-            engines: { baidu: true, google: false, duckduckgo: false, sogou: true, so360: true, toutiao: true, quark: false },
+            // 360 与搜狗默认关闭：桌面端 360 对新会话必下发 qcaptcha，搜狗结果是加密串解不出，
+            // 两者都会拖慢一次搜索、还经常一条证据都拿不到（详见 DEVELOPMENT.md「已知坑」）
+            engines: { baidu: true, google: false, duckduckgo: false, sogou: false, so360: false, toutiao: true, quark: false },
             trustedPlatforms: [...DEFAULT_TRUSTED_PLATFORMS],
             ai: { enabled: false, provider: 'openai', baseUrl: AI_PROVIDERS.openai.baseUrl, model: AI_PROVIDERS.openai.model, apiKey: '' },
             xsn: { enabled: false }
         };
     }
+
+    // 引擎 key → 日志里显示的中文名（ENGINE_VERIFY 只覆盖需要验证兜底的那几个）
+    const ENGINE_LABELS = {
+        baidu: '百度', google: 'Google', duckduckgo: 'DuckDuckGo', sogou: '搜狗',
+        so360: '360', toutiao: '头条', quark: '夸克'
+    };
+
+    // 默认关闭的引擎的迁移版本号。老配置里 360/搜狗 存的是 true，
+    // 只改 defaultConfig 对已存过配置的用户不生效（engines 是整体覆盖），
+    // 所以靠这个版本号做一次性回落；回落之后用户手动开启的选择会被保留。
+    const ENGINE_DEFAULTS_VERSION = 2;
+    const ENGINE_DEFAULT_OFF = ['so360', 'sogou'];
 
     function normalizeConfig(input) {
         if (!input || typeof input !== 'object' || input.version !== 2) return defaultConfig(); // 版本不符/旧配置 → 回到最新默认
@@ -138,7 +161,17 @@
             ...base,
             ...value,
             exclusions: { ...base.exclusions, ...(value.exclusions || {}), presets: { ...base.exclusions.presets, ...((value.exclusions || {}).presets || {}) }, words: Array.isArray((value.exclusions || {}).words) ? [...new Set(value.exclusions.words.filter(word => typeof word === 'string' && word.trim()))] : base.exclusions.words },
-            engines: { ...base.engines, ...(value.engines || {}), quark: false },
+            engines: {
+                ...base.engines,
+                ...(value.engines || {}),
+                quark: false, // 神马/夸克：验证模块无法脚本化，永久关闭
+                // 版本号落后就一次性回落到新的默认值（360/搜狗 默认关）；
+                // 已经迁移过的话，用户手动开启的选择不再被覆盖
+                ...(Number(value.engineDefaultsVersion || 0) < ENGINE_DEFAULTS_VERSION
+                    ? Object.fromEntries(ENGINE_DEFAULT_OFF.map(engine => [engine, false]))
+                    : {})
+            },
+            engineDefaultsVersion: ENGINE_DEFAULTS_VERSION,
             trustedPlatforms: Array.isArray(value.trustedPlatforms)
                 ? [...new Set(value.trustedPlatforms.filter(host => typeof host === 'string' && host.trim()).map(host => host.trim().toLowerCase()))]
                 : base.trustedPlatforms,
@@ -227,46 +260,100 @@
     // 各参考引擎的搜索地址。主机名必须同时出现在文件头的 @connect 里，否则 TM 会拒绝请求。
     // 注意头条：老代码用的是 www.so.toutiao.com，该主机已不存在（DNS 解析失败），
     // 会让头条参考静默拿不到数据，正确的主机是 so.toutiao.com。
+    // 注意 360：桌面端 www.so.com/s 对新会话一律下发 qcaptcha 验证，抓到的永远是挑战页；
+    // 移动端 m.so.com/s 服务端直出结果、不弹验证，且跳转壳是明文（/jump?u=），解析更稳。
     function engineSearchUrls(keyword) {
         const query = encodeURIComponent(keyword);
         return {
             google: `https://www.google.com/search?q=${query}`,
             duckduckgo: `https://html.duckduckgo.com/html/?q=${query}`,
             sogou: `https://www.sogou.com/web?query=${query}`,
-            so360: `https://www.so.com/s?q=${query}`,
+            so360: `https://m.so.com/s?q=${query}`,
             toutiao: `https://so.toutiao.com/search?keyword=${query}`,
             quark: `https://quark.sm.cn/s?q=${query}`
         };
     }
 
-    // 引擎结果页上的这些主机不参与证据抓取：它们是引擎自己的功能入口（AI 问答、风控反馈），
+    // 引擎结果页上的这些主机不参与证据抓取：它们是引擎自己的功能入口或自家内容平台，
     // 既不是"包壳跳转"，也不该写进 @connect（写了 TM 会真的去请求，白等 7 秒还污染证据集）
-    const NON_EVIDENCE_HOSTS = ['ai.so.com', 'fankui.sogou.com'];
+    const NON_EVIDENCE_HOSTS = [
+        'ai.so.com', 'fankui.sogou.com',
+        // 360 自家内容平台：结果里很常见，但不是目标官网
+        'baike.so.com', 'news.so.com', 'image.so.com', 'video.so.com', 'info.so.com',
+        '360kuai.com', '360kan.com'
+    ];
 
-    // 有的引擎把真实目标地址直接挂在结果 <a> 的属性上（如 360 的 data-mdurl / e-landurl），
-    // 那就读属性即可：零网络请求，也就不存在 @connect 拦跳转的问题。
-    // 属性不存在时退回 href（先尝试解码壳里的明文目标）。
-    const REAL_TARGET_ATTRS = ['data-mdurl', 'e-landurl'];
+    // 有的引擎把真实目标地址直接挂在结果元素的属性上（360 移动端 data-pcurl 是明文真实地址、
+    // data-url / data-mdurl / e-landurl 是跳转壳），读属性即可：零网络请求，
+    // 也就不存在 @connect 拦跳转的问题。属性不存在时退回 href（先尝试解码壳里的明文目标）。
+    const REAL_TARGET_ATTRS = ['data-pcurl', 'data-mdurl', 'e-landurl', 'data-url'];
 
-    // 壳地址里可能编码着明文目标的参数名（按优先级）
-    const EMBEDDED_TARGET_PARAMS = ['h5_url', 'uddg', 'q', 'url', 'target'];
+    // 壳地址里可能编码着明文目标的参数名（按优先级）。
+    // 'u' 是 360 移动端 /jump?u=<目标> 的明文参数名。
+    const EMBEDDED_TARGET_PARAMS = ['h5_url', 'uddg', 'q', 'url', 'u', 'target'];
+
+    // 头条每张结果卡片的容器上都挂了 data-log-extra，里面直接写着结果归属域名：
+    //   data-log-extra='{"host":"y.qq.com","url":"http://y.qq.com/",...}'
+    // 比解跳转壳稳得多：不受壳编码层数变化影响（登录态下壳会多包一层），也完全不需要网络请求。
+    // 卡片里 host 也可能是引擎自己（so.toutiao.com），读出来后照样按引擎域名过滤掉。
+    const CARD_HOST_ATTRS = ['data-log-extra', 'data-log-click', 'data-log-view'];
+    // 结果 <a> 到卡片容器（挂 data-log-extra 的那层）实测有 5 层，留点余量
+    const CARD_HOST_MAX_DEPTH = 6;
+
+    function hostFromCardPayload(raw) {
+        if (!raw || raw.indexOf('host') < 0) return '';
+        let data = null;
+        try { data = JSON.parse(raw); } catch (_) { return ''; }
+        const host = String((data && data.host) || '').toLowerCase();
+        if (!host || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host)) return '';
+        if (isEngineHost(host) || isSkippedHost(host)) return '';
+        return host;
+    }
+
+    // 从结果 <a> 往上找几层，把卡片元数据里的 host 读出来；找不到就返回空，交给后面的壳解析
+    function cardHostFrom(anchor) {
+        if (!anchor || typeof anchor.getAttribute !== 'function') return '';
+        let node = anchor;
+        for (let depth = 0; node && depth <= CARD_HOST_MAX_DEPTH; depth++) {
+            for (const name of CARD_HOST_ATTRS) {
+                const host = hostFromCardPayload(node.getAttribute(name));
+                if (host) return host;
+            }
+            node = node.parentElement || null;
+        }
+        return '';
+    }
+
+    // 属性值可能是明文直链（360 移动端的 data-pcurl），也可能仍是引擎自己的跳转壳
+    //（data-url 就是 m.so.com/jump?u=…），后者要再往下解一层才能拿到目标。
+    function hostFromAttrValue(raw, base) {
+        let url = null;
+        try { url = normalizeHttpUrl(new URL(raw, base).href); } catch (_) { return ''; }
+        if (!url) return '';
+        if (isSkippedHost(url.hostname)) return '';
+        if (isEngineHost(url.hostname)) return extractEmbeddedTarget(url.href, base, 0);
+        return url.hostname;
+    }
 
     // 结果项 → 真实目标主机名，全程零网络请求：
-    //   1) 目标挂在 <a> 属性上（360 的 data-mdurl / e-landurl）
-    //   2) 壳地址里编码了明文目标（解码，可递归）
-    //   3) 本来就是直链
+    //   1) 卡片元数据里直接写了归属域名（头条 data-log-extra 的 host）
+    //   2) 目标挂在元素属性上（360 的 data-pcurl / data-mdurl / e-landurl / data-url）
+    //   3) 壳地址里编码了明文目标（解码，可递归）
+    //   4) 本来就是直链
     // 都拿不到的（如搜狗 /link?url= 的加密串）直接放弃：不再跟跳转。
     // 因为 TM 对跳转落点同样校验 @connect，跟也只会被拦（Request was redirected to a
     // not whitelisted URL），白刷一屏红字且一条证据都拿不到。
     function resolveAnchorHost(anchor, base) {
         const attr = name => (anchor.getAttribute ? anchor.getAttribute(name) : null);
+        // 1) 卡片元数据直读：不受壳编码层数影响，头条登录态下壳会多包一层也不影响
+        const cardHost = cardHostFrom(anchor);
+        if (cardHost) return cardHost;
+        // 2) 元素属性上的真实目标
         for (const name of REAL_TARGET_ATTRS) {
             const raw = attr(name);
             if (!raw) continue;
-            try {
-                const url = normalizeHttpUrl(new URL(raw, base).href);
-                if (url && !isEngineHost(url.hostname) && !isSkippedHost(url.hostname)) return url.hostname;
-            } catch (_) { /* 属性值不是合法地址就继续看下一个 */ }
+            const host = hostFromAttrValue(raw, base);
+            if (host) return host;
         }
         const href = attr('href') || '';
         const embedded = extractEmbeddedTarget(href, base, 0);
@@ -282,10 +369,12 @@
         const urls = engineSearchUrls(keyword);
         const base = urls[engine];
         if (!base) return Promise.resolve(new Set());
-        const managed = Boolean(ENGINE_VERIFY[engine]); // 国内引擎：携带 cookie + 验证兜底
+        const managed = Boolean(ENGINE_VERIFY[engine]); // 国内引擎：验证兜底（提示条 / 重试）
+        // 移动端入口的引擎不依赖会话：匿名请求拿到的就是结果页
+        const useCookies = managed && !ENGINE_ANONYMOUS_ONLY.has(engine);
         return new Promise(resolve => GM_xmlhttpRequest({
             // followRedirects 关闭：被验证拦截时保留 3xx 与 Location，才能取到真实挑战地址（与百度一致）
-            method: 'GET', url: base, anonymous: !managed, followRedirects: !managed, timeout: 10000,
+            method: 'GET', url: base, anonymous: !useCookies, followRedirects: !managed, timeout: 10000,
             onload: async response => {
                 const hosts = new Set();
                 const finalUrl = response.finalUrl || base;
@@ -301,11 +390,17 @@
                     return resolve(hosts);
                 }
                 const doc = new DOMParser().parseFromString(response.responseText, 'text/html');
-                // 属性里带真实目标的引擎（360）不一定有 href，选择器要把这两种也算进来
-                const anchors = [...doc.querySelectorAll('a[href], a[data-mdurl], a[e-landurl]')];
+                // 属性里带真实目标的引擎（360）不一定有 <a href>，头条的归属域名在卡片容器上，
+                // 选择器要把这几种都算进来。带目标属性的元素几乎必然是结果项，先解析它们，
+                // 再用 a[href] 兜底（Google/头条等只有 href 的引擎）。
+                const prioritized = [...doc.querySelectorAll('[data-pcurl], [data-mdurl], [e-landurl], [data-url]')];
+                const rest = [...doc.querySelectorAll('a[href]')];
+                const anchors = [...new Set([...prioritized, ...rest])];
                 let iter = 0;
                 for (const anchor of anchors) {
-                    if (iter++ >= 25 || hosts.size >= 15) break; // 限制解析量与结果数
+                    // 结果项通常排在页面中后部（前面是导航、相关搜索、推荐位），扫描上限要放宽，
+                    // 否则 360 这种"前面一堆无关链接"的页面只能拿到两三条证据。
+                    if (iter++ >= 150 || hosts.size >= 15) break; // 限制解析量与结果数
                     const host = resolveAnchorHost(anchor, base);
                     if (host) hosts.add(host);
                 }
@@ -408,7 +503,7 @@
           <section><details class="bom-collapse" open><summary><h2>搜索行为</h2></summary><label><input type="checkbox" data-bom-enabled> 启用官网标记</label><label>保护模式 <select data-bom-mode><option value="download">下载保护（推荐）</option><option value="strict">严格保护</option><option value="mark">仅标记</option></select></label><label><input type="checkbox" data-bom-risk> 高风险链接始终拦截</label><label class="bom-inline">缓存时间 <input type="number" min="0" max="1440" data-bom-cache> 分钟</label><label>下载意图关键词（每行一个）<textarea rows="4" data-bom-download-words></textarea></label><label>下载扩展名（每行一个）<textarea rows="2" data-bom-download-exts></textarea></label></details></section>
           <section><details class="bom-collapse" open><summary><h2>排除词</h2></summary><p class="bom-note">命中排除词时不请求百度、不调用 AI，也不修改 Bing 结果。</p><div class="bom-presets"><label><input type="checkbox" data-bom-preset="weather"> 天气</label><label><input type="checkbox" data-bom-preset="news"> 新闻</label><label><input type="checkbox" data-bom-preset="lifestyle"> 生活</label><label><input type="checkbox" data-bom-preset="entertainment"> 娱乐</label><label><input type="checkbox" data-bom-preset="realtime"> 实时信息</label></div><label>自定义排除词（每行一个）<textarea rows="4" data-bom-words></textarea></label></details></section>
           <section><details class="bom-collapse"><summary><h2>可信平台（免检查名单）</h2></summary><p class="bom-note">命中名单的结果不再显示「未验证」/「需确认」，也不查询 XSN，改标绿色「可信平台」。这些平台本身可信，但页面内容由用户上传（仓库、帖子、评论、视频等），<strong>脚本只判定平台域名本身，不分析内容安全性</strong>，需要你自己判断。本地高危（HTTP、IP、短链、非标准端口等）仍然照常标红，不受名单豁免。</p><label>平台域名（每行一个，含子域）<textarea rows="4" data-bom-trusted></textarea></label></details></section>
-          <section><details class="bom-collapse" open><summary><h2>多引擎参考</h2></summary><div class="bom-presets"><label><input type="checkbox" data-bom-engine="baidu"> 百度认证</label><label><input type="checkbox" data-bom-engine="google"> Google</label><label><input type="checkbox" data-bom-engine="duckduckgo"> DuckDuckGo</label><label><input type="checkbox" data-bom-engine="sogou"> 搜狗</label><label><input type="checkbox" data-bom-engine="so360"> 360 搜索</label><label><input type="checkbox" data-bom-engine="toutiao"> 头条搜索</label><label><input type="checkbox" data-bom-engine="quark" disabled title="验证问题暂无法适配"> 神马搜索<span style="opacity:.6">（验证问题暂无法适配）</span></label></div><p class="bom-note">国内引擎（百度/360/搜狗/头条）抓取时携带浏览器既有 cookie；若被安全验证拦截，页面顶部会出现提示条，过码关窗后自动重试。神马/夸克因验证模块适配问题已禁用。</p></details></section>
+          <section><details class="bom-collapse" open><summary><h2>多引擎参考</h2></summary><div class="bom-presets"><label><input type="checkbox" data-bom-engine="baidu"> 百度认证</label><label><input type="checkbox" data-bom-engine="google" title="国内网络通常无法直连（TCP 连接超时），需自备代理才能用"> Google<span style="opacity:.6">（国内需代理）</span></label><label><input type="checkbox" data-bom-engine="duckduckgo" title="国内网络通常无法直连（TCP 连接超时），需自备代理才能用"> DuckDuckGo<span style="opacity:.6">（国内需代理）</span></label><label><input type="checkbox" data-bom-engine="sogou" title="结果链接是加密串，本地解不出，且频繁触发 antispider 验证"> 搜狗<span style="opacity:.6">（验证 + 加密壳，默认关）</span></label><label><input type="checkbox" data-bom-engine="so360" title="桌面端对新会话必下发 qcaptcha 验证，已改走移动端入口但仍可能受 IP 风控影响"> 360 搜索<span style="opacity:.6">（易触发验证，默认关）</span></label><label><input type="checkbox" data-bom-engine="toutiao"> 头条搜索</label><label><input type="checkbox" data-bom-engine="quark" disabled title="验证问题暂无法适配"> 神马搜索<span style="opacity:.6">（验证问题暂无法适配）</span></label></div><p class="bom-note">国内引擎抓取时携带浏览器既有 cookie；若被安全验证拦截，页面顶部会出现提示条，过码关窗后自动重试。<strong>360 与搜狗默认关闭</strong>：360 桌面端对新会话必下发 qcaptcha（现改走移动端入口，仍可能受 IP 风控），搜狗的结果链接是加密串（<code>/link?url=</code>）本地解不出、且频繁触发 antispider，两者经常一条证据都拿不到还会拖慢搜索。需要时可手动勾选，或用「参考引擎证据」日志确认它们是否真的在贡献证据。<strong>Google 与 DuckDuckGo 在国内通常无法直连</strong>（实测 TCP 连接超时，且 DNS 会被解析到无关地址），只有挂了代理的环境才用得上。神马/夸克因验证模块适配问题已禁用。</p></details></section>
           <section><details class="bom-collapse"><summary><h2>XSN 情报</h2></summary><label><input type="checkbox" data-bom-xsn-enabled> 启用 XSN 情报查询</label><p class="bom-note">启用后按域名查询 XSN 情报，命中 <code>critical</code>/<code>high</code> 的结果标红为「XSN 风险」，悬停显示家族、等级、置信度与全网命中次数。本地规则只覆盖明文类特征（HTTP、IP、短链、非标准端口），像 HTTPS + 正常端口 + 真域名的站点本地只能给出「未验证」，这部分由 XSN 情报补上。</p></details></section>
           <section><details class="bom-collapse"><summary><h2>AI 辅助比对</h2></summary><label><input type="checkbox" data-bom-ai-enabled> 启用 AI 辅助分析</label><label>服务商 <select data-bom-ai-provider><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="qwen">通义千问</option><option value="custom">自定义 OpenAI 兼容接口</option></select></label><label>接口地址 <input type="url" data-bom-ai-url placeholder="https://api.example.com/v1"></label><label>API Key <input type="password" data-bom-ai-key autocomplete="off" placeholder="只保存在浏览器扩展存储"></label><label>模型 <select data-bom-ai-model-select data-bom-model-select><option value="custom">自定义</option></select></label><button type="button" data-bom-fetch-models>获取模型列表</button><label data-bom-custom-model hidden>自定义模型 <input type="text" data-bom-ai-model-custom placeholder="输入模型名称"></label><p class="bom-model-status" data-bom-model-status></p><p class="bom-note">只发送搜索词、标题、域名和 URL，不发送网页正文。AI 不能解除本地高风险拦截。</p></details></section>
           <div class="bom-actions"><button type="button" data-bom-reset>恢复默认</button><button type="button" data-bom-cancel>取消</button><button type="button" data-bom-save>保存配置</button></div><div class="bom-status" role="status" data-bom-status></div>
@@ -726,6 +821,8 @@
         return new Promise((resolve) => {
             const cached = readCache(keyword);
             if (cached) {
+                // 不打日志时，命中缓存与"请求被拦"在控制台上长得一模一样，排查会误判
+                console.log('[官网补全] 百度结果命中缓存（10 分钟内）:', keyword, cached.length, '条');
                 resolve(cached);
                 return;
             }
@@ -1117,6 +1214,16 @@
         const engineResults = await Promise.all(engineEntries.map(async ([engine]) => [engine, await fetchEngineDomains(referenceKeyword, engine)]));
         const engineEvidence = Object.fromEntries(engineResults);
         if (config.engines.baidu) engineEvidence.baidu = new Set(officialLinks.map(item => item.displayDomain));
+        // 抓取成功时本来是全程静默的，和"请求被拦/解析不到"在控制台上无法区分，
+        // 所以这里把每个引擎拿到的域名数打出来：看到 0 就知道该引擎实际没贡献证据。
+        console.log('[官网补全] 参考引擎证据:', Object.entries(engineEvidence)
+            .map(([engine, hosts]) => `${ENGINE_LABELS[engine] || engine} ${hosts.size}`)
+            .join('、') || '（无）');
+        // 0 条不一定是"被验证拦截"（那条有单独的 warn），也可能是页面结构变了或该词本来就没官网，
+        // 总之值得提示一句，否则用户只能看到"什么都没发生"
+        Object.entries(engineEvidence).forEach(([engine, hosts]) => {
+            if (!hosts.size) console.warn('[官网补全] ' + (ENGINE_LABELS[engine] || engine) + ' 本次未拿到任何证据');
+        });
 
         const aiReview = await requestAiReview(keyword, officialLinks, config);
         if (aiReview && searchId === activeSearchId) {
@@ -1132,6 +1239,7 @@
 
         const bingItems = container.querySelectorAll(SELECTOR_BING_ITEM);
         const matchedSet = new Set();
+        console.log('[官网补全] Bing 结果项:', bingItems.length, '｜百度认证官网:', officialLinks.length);
 
         // 先批量取回本页结果域名的 XSN 公开情报（缓存 10 分钟），再统一做标记。
         // 免检查名单里的域名不查 XSN：既不检查，也不把这些域名发出去
@@ -1202,7 +1310,11 @@
         // 插入未匹配的官网（这些是百度认证的，直接显示官网）
         const unmatched = officialLinks.filter(o => !matchedSet.has(o.url));
         if (unmatched.length === 0) {
-            console.log('[官网补全] 所有官网已匹配');
+            // officialLinks 为空时也会走到这里，不能报成"所有官网已匹配"——那是空跑，不是成功
+            const note = officialLinks.length
+                ? `标记 ${matchedSet.size} 条结果，无待插入官网`
+                : '百度未返回认证官网，本页仅按本地规则标记';
+            console.log('[官网补全] 处理完成：' + note);
             return;
         }
 
@@ -1253,11 +1365,11 @@
             console.log('[官网补全] 已插入官网（顶部）:', o.title);
         });
 
-        console.log('[官网补全] 处理完成');
+        console.log(`[官网补全] 处理完成：标记 ${matchedSet.size} 条结果，插入 ${unmatched.length} 个官网`);
     }
 
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision, defaultConfig, normalizeConfig, aiProviderPresets, exclusionPresetWords, shouldExcludeKeyword, summarizeEngineEvidence, extractModelIds, hasDownloadIntent, isDownloadUrl, shouldConfirmNavigation, stripDownloadKeywords, looksLikeChallenge, pickCaptchaSource, isVerificationResponse, trustedPlatformFor, applyTrustedPlatformVerdict, xsnIocIndex, xsnLookupHit, xsnIsHigh, xsnHitTitle, applyXsnVerdict, xsnLookupHosts, engineSearchUrls, isEngineHost, extractEmbeddedTarget, resolveAnchorHost, NON_EVIDENCE_HOSTS, REAL_TARGET_ATTRS, EMBEDDED_TARGET_PARAMS, fetchEngineDomains };
+        module.exports.__test__ = { normalizeHttpUrl, classifyUrl, getMatchType, getResultDecision, defaultConfig, normalizeConfig, aiProviderPresets, exclusionPresetWords, shouldExcludeKeyword, summarizeEngineEvidence, extractModelIds, hasDownloadIntent, isDownloadUrl, shouldConfirmNavigation, stripDownloadKeywords, looksLikeChallenge, pickCaptchaSource, isVerificationResponse, trustedPlatformFor, applyTrustedPlatformVerdict, xsnIocIndex, xsnLookupHit, xsnIsHigh, xsnHitTitle, applyXsnVerdict, xsnLookupHosts, engineSearchUrls, isEngineHost, extractEmbeddedTarget, resolveAnchorHost, hostFromAttrValue, cardHostFrom, hostFromCardPayload, NON_EVIDENCE_HOSTS, REAL_TARGET_ATTRS, EMBEDDED_TARGET_PARAMS, CARD_HOST_ATTRS, fetchEngineDomains };
         return;
     }
 

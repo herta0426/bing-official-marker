@@ -79,16 +79,33 @@ test('normalizes imported config and never invents an API key', () => {
   assert.equal(config.ai.provider, 'deepseek');
   assert.equal(config.ai.apiKey, '');
   assert.equal(config.engines.baidu, true);
-  assert.equal(config.engines.so360, true); // 国内可用中文引擎默认开启
-  assert.equal(config.engines.toutiao, true);
-  assert.equal(config.engines.quark, false); // 神马/夸克禁用
+  assert.equal(config.engines.toutiao, true);   // 头条可正常解析，默认开
+  assert.equal(config.engines.so360, false);    // 易触发 qcaptcha，默认关
+  assert.equal(config.engines.sogou, false);    // 加密壳解不出 + antispider，默认关
+  assert.equal(config.engines.quark, false);    // 神马/夸克禁用
+});
+
+test('老配置里开启的 360/搜狗 会被一次性回落为关闭', () => {
+  const legacy = api.normalizeConfig({
+    version: 2, enabled: true, exclusions: {}, ai: {},
+    engines: { baidu: true, so360: true, sogou: true, toutiao: true }
+  });
+  assert.equal(legacy.engines.so360, false);
+  assert.equal(legacy.engines.sogou, false);
+  assert.equal(legacy.engines.baidu, true);    // 其它引擎不受牵连
+  assert.equal(legacy.engines.toutiao, true);
+  // 回落之后用户手动开启的选择要保留，不能每次载入都被按回去
+  const optedIn = api.normalizeConfig({ ...legacy, engines: { ...legacy.engines, so360: true } });
+  assert.equal(optedIn.engines.so360, true);
+  assert.equal(optedIn.engines.sogou, false);
 });
 
 test('版本不符的旧配置自动回落到最新默认', () => {
   const stale = { version: 1, protectionMode: 'download', engines: { baidu: true, so360: false } };
   const config = api.normalizeConfig(stale);
   assert.equal(config.protectionMode, 'mark'); // 回落默认
-  assert.equal(config.engines.so360, true); // 新默认生效
+  assert.equal(config.engines.so360, false); // 新默认生效（360 默认关）
+  assert.equal(config.engines.sogou, false);
   assert.deepStrictEqual(config, api.defaultConfig()); // 与默认完全一致
 });
 
@@ -408,7 +425,10 @@ test('抓取循环优先用属性解析，不因壳链接发起跳转请求', as
   const fs = require('node:fs');
   const path = require('node:path');
   const source = fs.readFileSync(path.join(__dirname, '..', 'baidudreamourbings.user.js'), 'utf8');
-  assert.ok(source.includes('a[href], a[data-mdurl], a[e-landurl]'), '选择器要覆盖只有属性的结果项');
+  // 选择器要覆盖只有属性的结果项（360 的 data-pcurl / data-url 挂在非 <a> 元素上）
+  assert.ok(source.includes('[data-pcurl], [data-mdurl], [e-landurl], [data-url]'), '选择器要覆盖只有属性的结果项');
+  assert.ok(source.includes("a[href]"), '仍要扫描只有 href 的引擎（Google / 头条）');
+  assert.ok(api.REAL_TARGET_ATTRS.includes('data-pcurl'));
   assert.ok(api.REAL_TARGET_ATTRS.includes('data-mdurl'));
   assert.ok(api.REAL_TARGET_ATTRS.includes('e-landurl'));
 });

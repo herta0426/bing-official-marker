@@ -96,20 +96,36 @@ Bing 搜索页加载 / SPA 导航 / MutationObserver
 ```bash
 node --check baidudreamourbings.user.js   # 语法检查
 node --test tests/security-helpers.test.js # 单元测试（纯函数，无浏览器）
+npm i -D jsdom && node --test tests/engine-live.test.js  # 真实抓包样本回归（需要 jsdom 提供 DOMParser）
+```
+
+`tests/fixtures/` 里存的是真实抓回来的结果页片段（头条登录态/服务端直出、360 移动端），
+引擎改版会先在这些用例里红。**没装 jsdom 时依赖 DOM 的用例自动 skip**，纯函数用例照常跑。
+
+排查引擎失效时的抓包姿势（脚本只拿得到服务端直出的 HTML，拿不到 JS 渲染后的 DOM）：
+
+```bash
+curl -sSL -A "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ... Mobile Safari/604.1" \
+  "https://m.so.com/s?q=QQ%E9%9F%B3%E4%B9%90" -o /tmp/so360m.html
+curl -sSL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/131.0.0.0 Safari/537.36" \
+  "https://so.toutiao.com/search?keyword=QQ%E9%9F%B3%E4%B9%90" -o /tmp/tt.html
 ```
 
 ## 已知坑 / 注意事项
 
 - 搜索引擎链路脆弱：靠 DOM 抓取，站点改版即失效。
 - **不要再"跟随重定向取真实域名"**：Tampermonkey 不仅校验 `GM_xmlhttpRequest` 的初始 URL，**对跨域跳转的落点同样校验**。壳跳转必然离开引擎域名落到目标站，落点不在白名单就中断，报 `Request was redirected to a not whitelisted URL`（不是"验证拦截"）。实测一次搜索周期内刷出 37 条这种拒绝（落点正是 `www.douyin.com` 等真实目标），而一条证据都拿不到——所以 1.3 起**彻底删掉跟跳转**（原 `resolveRealHost` 已移除），改为 `resolveAnchorHost` 的零请求解析链。
-- **零请求解析链**（`resolveAnchorHost`，见该函数注释）：① 属性 `data-mdurl` / `e-landurl`（360）；② 壳地址里编码的明文目标，`EMBEDDED_TARGET_PARAMS` 递归解码（头条 `/search/jump?…&url=<编码的 zlink，其 h5_url 再编码一层>`、Google `/url?q=`、DDG `/l/?uddg=`）；③ 直链取主机名。解出来仍落在引擎域（如头条自己的 `m.toutiao.com` 文章页）就当没有，避免污染证据集；完全解不出的壳（搜狗 `/link?url=hedJjaC…` 加密串）直接放弃。**线上实测**：对 `so.toutiao.com/search?keyword=抖音` 的真实 4.4MB 页面，单页可解出 `www.douyin.com`、`musician.douyin.com`、`creator.douyin.com`、`m.wandoujia.com`、`www.bilibili.com` 等，全程零请求。
+- **零请求解析链**（`resolveAnchorHost`，见该函数注释）：① 卡片元数据 `data-log-extra` 的 `host`（头条，最可靠）；② 元素属性 `data-pcurl`（360 移动端明文真实地址）/ `data-mdurl` / `e-landurl` / `data-url`，属性值本身还是引擎壳时继续解一层；③ 壳地址里编码的明文目标，`EMBEDDED_TARGET_PARAMS` 递归解码（头条 `/search/jump?…&url=<编码的 zlink，其 h5_url 再编码一层>`、360 移动端 `/jump?u=`、Google `/url?q=`、DDG `/l/?uddg=`）；④ 直链取主机名。解出来仍落在引擎域（如头条自己的 `m.toutiao.com` 文章页）就当没有，避免污染证据集；完全解不出的壳（搜狗 `/link?url=hedJjaC…` 加密串）直接放弃。**线上实测**：对 `so.toutiao.com/search?keyword=抖音` 的真实 4.4MB 页面，单页可解出 `www.douyin.com`、`musician.douyin.com`、`creator.douyin.com`、`m.wandoujia.com`、`www.bilibili.com` 等，全程零请求。
 - **若哪天想让搜狗也贡献证据**：它的 `url=` 是加密的，本地解不出，只能靠跟跳转，而跟跳转需要 `@connect *`（放宽权限面）。当前取舍是：宁可少一个引擎的证据，也不放宽权限、不刷红字。
 - **搜狗"降级到 http 拿明文直链"的旧技巧已失效**（2023 年的做法）：实测 `http://www.sogou.com/web?query=` 现在 302 回 `https://www.sogou.com/web?...`，响应体只有 137 字节，拿不到明文直链。
-- **360 验证墙**：`https://www.so.com/s?q=` 会被 302 到 `http://qcaptcha.so.com/?ret=…&tk=…`（标题"访问异常页面"，数字验证码）。**实测带真实 cookie 的正常浏览器会话同样被拦**，所以不能只靠 cookie 绕过，必须走"提示条 → 过码 → 关窗重试"。`qcaptcha.so.com` 必须写在 `@connect` 里，否则 TM 拒绝跳转、脚本静默拿到空集合（这是"加了检测却没有任何日志"的根因）。
+- **360 验证墙 → 改用移动端入口绕开（1.4）**：`https://www.so.com/s?q=` 会被 302 到 `http://qcaptcha.so.com/?ret=…&tk=…`（标题"访问异常页面"，数字验证码）。**实测带真实 cookie 的正常浏览器会话同样被拦**，走"提示条 → 过码 → 关窗重试"也不能稳定复用结果（360 是 IP/行为风控）。而移动端 `https://m.so.com/s?q=` 服务端直出完整结果、不弹验证，且不依赖 cookie——所以 1.4 起 360 的请求主机改为 `m.so.com`，请求改匿名（`ENGINE_ANONYMOUS_ONLY`）。移动端还有两个额外好处：卡片上直接挂着明文真实地址 `data-pcurl="https://y.qq.com/"`，跳转壳也是明文 `/jump?u=<目标>`（桌面端是加密的 `/link?m=`）。`qcaptcha.so.com` 仍保留在 `@connect` 里（万一被风控跳转，TM 不至于拒绝）。
 - **搜狗验证墙**：`https://www.sogou.com/web?query=` 会被 302 到 `https://www.sogou.com/antispider/?m=1&antip=web_hd&from=…`。host 是已白名单的 `www.sogou.com`，所以**只能靠路径段 `antispider` 识别**——把它加进 `looksLikeChallenge` 之前，这种响应会被当成普通非 200 静默丢弃。
 - **引擎自家功能入口不参与证据抓取**：`fankui.sogou.com`（搜狗风控反馈端点）、`ai.so.com`（360 结果页的 AI 问答 tab）都不是"包壳跳转"，但 `resolveRealHost` 的 `wrapped` 正则会把它们当包壳去请求；它们又不在 `@connect` 里，TM 会拒绝并在控制台抛 `This domain is not a part of the @connect list`（红字，看着像脚本坏了）。现在这两个主机写在 `NON_EVIDENCE_HOSTS` 里，在发请求**之前**就跳过：既没有红字报错，也不会白等 7 秒。**不要把它们加进 `@connect`**——加了 TM 会真的去请求（最多 25 次 × 7s），而且解析出来的引擎域名会污染证据集合。
 - **头条搜索主机已变更**：老代码请求 `https://www.so.toutiao.com/search?keyword=`，该主机已不存在（DNS NXDOMAIN），GM_xmlhttpRequest 直接走 `onerror`，而 `err.error` 对这种连接失败是 `undefined`，于是被旧日志误报成"可能是验证跳转到了未授权域名"——实际和验证无关，线索全被误导。现有实现：请求主机改为 `so.toutiao.com`（实测 200，标题「抖音-头条搜索」），`ENGINE_VERIFY.toutiao.home` 同步改掉，`@connect` 同步替换；`onerror` 日志改为区分「@connect 被拒 / HTTP 状态 / 连接失败」，并补上 `ontimeout` 的 warn（以前超时是完全静默的）。**改版/下线这类问题只能靠真实请求发现**，所以 `engineSearchUrls` 被独立出来，配了一条单测校验"每个引擎的请求主机都在 `@connect` 白名单里"。
 - **头条结果链接是 `/search/jump?jtoken=…` 相对跳转**：目标站点通过跳转才能拿到（实测跟随后落到 `www.douyin.com`、`musician.douyin.com`）。注意首次抓取返回的页面体积/结构会随会话状态变化（4.4MB 完整版 vs 只有导航的轻量版），排查时以浏览器里的实际响应为准。
+- **登录态下头条的壳会多包一层，且落在 `sou.toutiao.com`（1.4）**：未登录时壳是 `/search/jump?url=http%3A%2F%2Fi.y.qq.com%2F…`（单层，可直接解码）；登录后变成 `https://sou.toutiao.com/search/jump?url=<又一层编码的 jump?url=>`（两层），主机也从 `so.toutiao.com` 变成 `sou.toutiao.com`——后者不在 `@connect` 里，**跟跳转必被拦**（这正是旧版 `头条 请求被中断（可能是验证跳转到了未授权域名）` 的成因，和验证毫无关系）。1.4 起优先读结果卡片容器上的 `data-log-extra`，里面直接写着归属域名 `{"host":"y.qq.com","url":"http://y.qq.com/"}`：零请求、零解码，壳再包几层都不受影响。**不要用 DevTools 复制出来的绝对 XPath**（如 `/html/body/div[3]/div[2]/div[3]/…`）去定位卡片，结构与位置都会变；用 `[data-log-extra]` 这类属性选择器。
+- **结果扫描上限**：结果项常排在页面中后部，前面是导航、相关搜索、推荐位，1.4 起扫描上限 25 → 150，并优先解析带目标属性的元素（`[data-pcurl]` 等几乎必然是结果项）。实测 360/头条单页证据由 2～4 条提升到 8 条。
 - 神马/夸克：`www.sm.cn`→`m.sm.cn` 会跳并触发阿里 x5sec 滑块，对匿名请求固定返回验证页，因此禁用。
+- **Google / DuckDuckGo 在国内基本不可达（2026-10 实测，江苏常州电信）**：`--noproxy '*'` 直连 `html.duckduckgo.com`、`duckduckgo.com`、`www.google.com` **三次全部 TCP 连接超时**（20s 无响应，非 RST）；同时 DNS 被污染——`html.duckduckgo.com` 解析到 `162.125.32.6` / `2a03:2880:f10f:83:…`（这两个段根本不是 DDG 的）。对照组 `www.bing.com` / `so.toutiao.com` / `m.so.com` 直连均 0.2～0.7s 正常返回，说明不是本地网络问题。结论：这两个引擎只有代理环境才用得上，默认关闭是对的，**不要因为"多引擎交叉验证更可信"就把它俩打开**——开了只会每次搜索白等一个 10s 超时。排查时注意本机若有代理（如 WorkBuddy 自带的 `127.0.0.1` 服务代理），curl 会走 CONNECT 隧道并报 `502`，要用 `--noproxy '*'` 才能反映真实直连情况。
 - 频繁请求会触发百度 wappass，可能被风控激化；提示条应手动重试而非自动循环。
 - 下载保护曾有 bug，默认"仅标记"；如需下载拦截先真实环境验证。
